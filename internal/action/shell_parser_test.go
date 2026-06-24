@@ -36,6 +36,25 @@ func TestParserMapsSubmitCommand(t *testing.T) {
 	if len(calls) != 1 || calls[0].Name != "submit" {
 		t.Fatalf("expected submit call, got %#v", calls)
 	}
+	if len(calls[0].Args) != 0 {
+		t.Fatalf("expected bare submit to have no args, got %#v", calls[0].Args)
+	}
+}
+
+func TestParserUsesSubmitProseAsSubmission(t *testing.T) {
+	parser := NewParser()
+	calls, err := parser.Parse(core.ModelResponse{
+		Message: core.Message{Role: core.RoleAssistant, Content: "Implemented the fix and ran tests.\n\n```swe_shell\nsubmit\n```"},
+	})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if len(calls) != 1 || calls[0].Name != "submit" {
+		t.Fatalf("expected submit call, got %#v", calls)
+	}
+	if got := calls[0].Args["submission"]; got != "Implemented the fix and ran tests." {
+		t.Fatalf("unexpected submission: %#v", got)
+	}
 }
 
 func TestParserRejectsMultipleBlocks(t *testing.T) {

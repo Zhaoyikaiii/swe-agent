@@ -36,10 +36,22 @@ func (Parser) Parse(resp core.ModelResponse) ([]core.ToolCall, error) {
 		return nil, errors.New("empty shell action")
 	}
 	if cmd == "submit" {
-		return []core.ToolCall{{Name: "submit"}}, nil
+		call := core.ToolCall{Name: "submit"}
+		if submission := submissionText(content); submission != "" {
+			call.Args = map[string]any{"submission": submission}
+		}
+		return []core.ToolCall{call}, nil
 	}
 	return []core.ToolCall{{
 		Name: "shell",
 		Args: map[string]any{"command": cmd},
 	}}, nil
+}
+
+func submissionText(content string) string {
+	withoutAction := strings.TrimSpace(fencedBlock.ReplaceAllString(content, ""))
+	if withoutAction == "" {
+		return ""
+	}
+	return withoutAction
 }

@@ -12,7 +12,7 @@ go run ./cmd/sweagent tools
 go run ./cmd/sweagent run --task "finish immediately" --repo . --json
 ```
 
-默认无参数会进入交互式 TUI。在底部输入 task 后回车即可发起一次运行；运行完成后可以继续输入下一条 task。常用 slash command 包括 `/clear` 清空当前 TUI 会话视图、`/quit` 退出、`/trace` 查看轨迹路径。
+默认无参数会进入交互式 TUI。在底部输入 task 后回车即可发起一次运行；运行完成后可以继续输入下一条 task。常用 slash command 包括 `/history` 查看并切换历史 task、`/clear` 清空当前 TUI 会话视图、`/quit` 退出、`/trace` 查看轨迹路径。
 
 默认使用 `mock` 模型，适合本地验证框架链路。接入 OpenAI-compatible 模型时，修改 `configs/default.yaml` 或通过命令行覆盖：
 

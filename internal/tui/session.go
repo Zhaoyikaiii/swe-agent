@@ -1,13 +1,14 @@
 package tui
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,6 +142,35 @@ const (
 	viewTrace
 )
 
+type sidebarMode int
+
+const (
+	sidebarChat sidebarMode = iota
+	sidebarHistory
+)
+
+type chatEntry struct {
+	Role  string
+	Title string
+	Body  string
+	Time  time.Time
+}
+
+type taskRecord struct {
+	ID         int
+	Task       core.Task
+	Events     []core.Event
+	Chat       []chatEntry
+	Result     agentpkg.Result
+	RunErr     error
+	Status     string
+	Summary    string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Selected   int
+	ChatOffset int
+}
+
 type approvalState struct {
 	msg      approvalMsg
 	expanded bool
@@ -162,15 +192,20 @@ type model struct {
 	mode       uiMode
 	beforeHelp uiMode
 	view       detailView
+	sidebar    sidebarMode
 	focus      string
 
-	events         []core.Event
-	selected       int
-	timelineOffset int
-	detail         viewport.Model
-	help           help.Model
-	spinner        spinner.Model
-	command        textinput.Model
+	tasks         []taskRecord
+	nextTaskID    int
+	activeTask    int
+	selectedTask  int
+	selected      int
+	chatOffset    int
+	historyOffset int
+	detail        viewport.Model
+	help          help.Model
+	spinner       spinner.Model
+	command       textinput.Model
 
 	approval *approvalState
 	result   agentpkg.Result
@@ -219,20 +254,24 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, parent conte
 	h := help.New()
 
 	return &model{
-		session:   session,
-		agent:     ag,
-		task:      task,
-		parent:    parent,
-		mode:      modeNormal,
-		view:      viewEvent,
-		focus:     "timeline",
-		selected:  -1,
-		detail:    detail,
-		help:      h,
-		spinner:   spin,
-		command:   command,
-		status:    "starting",
-		startedAt: time.Now(),
+		session:      session,
+		agent:        ag,
+		task:         task,
+		parent:       parent,
+		mode:         modeNormal,
+		view:         viewEvent,
+		sidebar:      sidebarChat,
+		focus:        "sidebar",
+		nextTaskID:   1,
+		activeTask:   -1,
+		selectedTask: -1,
+		selected:     -1,
+		detail:       detail,
+		help:         h,
+		spinner:      spin,
+		command:      command,
+		status:       "starting",
+		startedAt:    time.Now(),
 	}
 }
 
@@ -300,6 +339,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		m.result = msg.result
 		m.runErr = msg.err
+		m.finishActiveTask(msg.result, msg.err)
 		if msg.err != nil {
 			m.status = "error: " + msg.err.Error()
 		} else {
@@ -376,11 +416,17 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 	case "k", "up":
 		m.moveSelection(-1)
 	case "h", "left":
-		m.focus = "timeline"
-	case "l", "right", "enter":
+		m.focus = "sidebar"
+	case "l", "right":
+		m.focus = "detail"
+	case "enter":
+		if m.sidebar == sidebarHistory && m.focus == "sidebar" {
+			m.showChat()
+			return nil
+		}
 		m.focus = "detail"
 	case "G", "end":
-		m.selectIndex(len(m.events) - 1)
+		m.selectLast()
 	case "ctrl+d":
 		m.scrollDetailHalfPage(1)
 	case "ctrl+u":
@@ -398,9 +444,7 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		m.focus = "detail"
 		m.updateDetail()
 	case "t":
-		m.view = viewEvent
-		m.focus = "timeline"
-		m.updateDetail()
+		m.showChat()
 	case "o":
 		m.focus = "detail"
 	case "g", "z":
@@ -419,7 +463,7 @@ func (m *model) handlePendingKey(keyString string) bool {
 	m.pendingKey = ""
 	switch pending + keyString {
 	case "gg":
-		m.selectIndex(0)
+		m.selectFirst()
 		return true
 	case "zz":
 		m.centerSelection()
@@ -601,12 +645,12 @@ func (m *model) executeCommand(command string) tea.Cmd {
 		m.view = viewDiff
 		m.focus = "detail"
 		m.updateDetail()
-	case "t", "timeline", "events":
-		m.view = viewEvent
-		m.focus = "timeline"
-		m.updateDetail()
+	case "t", "timeline", "events", "chat":
+		m.showChat()
 	case "clear":
 		m.clearSession()
+	case "history", "tasks":
+		m.showHistory()
 	case "trace":
 		m.view = viewTrace
 		m.focus = "detail"
@@ -635,10 +679,10 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 		m.view = viewDiff
 		m.focus = "detail"
 		m.updateDetail()
-	case "t", "timeline", "events":
-		m.view = viewEvent
-		m.focus = "timeline"
-		m.updateDetail()
+	case "t", "timeline", "events", "chat":
+		m.showChat()
+	case "history", "tasks":
+		m.showHistory()
 	case "trace":
 		m.view = viewTrace
 		m.focus = "detail"
@@ -649,7 +693,7 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 	default:
 		m.status = "unknown slash command: /" + command
 	}
-	if m.loop && !m.running && m.mode != modeHelp {
+	if m.loop && !m.running && m.mode == modeTask {
 		m.prepareTaskInput(true)
 		return m.command.Focus()
 	}
@@ -664,7 +708,7 @@ func (m *model) openTaskMode() tea.Cmd {
 func (m *model) prepareTaskInput(reset bool) {
 	m.mode = modeTask
 	m.command.Prompt = "task> "
-	m.command.Placeholder = "type a task or /clear"
+	m.command.Placeholder = "type a task or /history"
 	m.command.Width = max(10, m.width-4)
 	if reset {
 		m.command.Reset()
@@ -695,26 +739,39 @@ func (m *model) startRun(task core.Task) tea.Cmd {
 	m.result = agentpkg.Result{}
 	m.runErr = nil
 	m.startedAt = time.Now()
+	taskIndex := m.createTaskRecord(task, "running", m.startedAt)
+	m.activeTask = taskIndex
+	m.setSelectedTask(taskIndex)
 	m.mode = modeNormal
 	m.command.Blur()
 	m.view = viewEvent
-	m.focus = "timeline"
+	m.sidebar = sidebarChat
+	m.focus = "sidebar"
 	m.status = "running task: " + shortString(task.Text, 48)
 	m.updateDetail()
 	return runAgent(m.runCtx, m.agent, m.task)
 }
 
 func (m *model) clearSession() {
-	m.events = nil
+	if m.running {
+		m.status = "cannot clear while a task is running"
+		return
+	}
+	m.tasks = nil
+	m.nextTaskID = 1
+	m.activeTask = -1
+	m.selectedTask = -1
 	m.selected = -1
-	m.timelineOffset = 0
+	m.chatOffset = 0
+	m.historyOffset = 0
 	m.result = agentpkg.Result{}
 	m.runErr = nil
 	m.done = false
 	m.query = ""
 	m.pendingKey = ""
 	m.view = viewEvent
-	m.focus = "timeline"
+	m.sidebar = sidebarChat
+	m.focus = "sidebar"
 	m.detail.GotoTop()
 	m.drainEvents()
 	m.status = "cleared"
@@ -761,65 +818,357 @@ func (m *model) answerApproval(decision policy.ApprovalDecision) {
 	m.updateDetail()
 }
 
+func (m *model) createTaskRecord(task core.Task, status string, startedAt time.Time) int {
+	if m.nextTaskID == 0 {
+		m.nextTaskID = 1
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	record := taskRecord{
+		ID:        m.nextTaskID,
+		Task:      task,
+		Status:    status,
+		StartedAt: startedAt,
+		Selected:  -1,
+	}
+	m.nextTaskID++
+	m.tasks = append(m.tasks, record)
+	return len(m.tasks) - 1
+}
+
+func (m *model) selectedTaskRecord() *taskRecord {
+	if m.selectedTask < 0 || m.selectedTask >= len(m.tasks) {
+		return nil
+	}
+	return &m.tasks[m.selectedTask]
+}
+
+func (m *model) activeTaskRecord() *taskRecord {
+	if m.activeTask < 0 || m.activeTask >= len(m.tasks) {
+		return nil
+	}
+	return &m.tasks[m.activeTask]
+}
+
+func (m *model) selectedEvents() []core.Event {
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return nil
+	}
+	return record.Events
+}
+
+func (m *model) selectedChat() []chatEntry {
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return nil
+	}
+	return record.Chat
+}
+
+func (m *model) selectedResult() agentpkg.Result {
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return m.result
+	}
+	return record.Result
+}
+
+func (m *model) saveSelectedTaskView() {
+	if record := m.selectedTaskRecord(); record != nil {
+		record.Selected = m.selected
+		record.ChatOffset = m.chatOffset
+	}
+}
+
+func (m *model) setSelectedTask(index int) {
+	m.saveSelectedTaskView()
+	if len(m.tasks) == 0 {
+		m.selectedTask = -1
+		m.selected = -1
+		m.chatOffset = 0
+		return
+	}
+	m.selectedTask = clamp(index, 0, len(m.tasks)-1)
+	record := m.selectedTaskRecord()
+	if record == nil || len(record.Chat) == 0 {
+		m.selected = -1
+		m.chatOffset = 0
+		return
+	}
+	m.selected = clamp(record.Selected, 0, len(record.Chat)-1)
+	m.chatOffset = max(0, record.ChatOffset)
+	m.ensureChatVisible()
+}
+
+func (m *model) ensureEventTask(event core.Event) int {
+	if m.activeTask >= 0 && m.activeTask < len(m.tasks) {
+		return m.activeTask
+	}
+	task := m.task
+	if event.Type == "user_task" {
+		task.Text = strings.TrimSpace(fmt.Sprint(event.Data["task"]))
+		task.Repo = strings.TrimSpace(fmt.Sprint(event.Data["repo"]))
+	}
+	if task.Repo == "" && m.agent != nil && m.agent.Workspace != nil {
+		task.Repo = m.agent.Workspace.Root()
+	}
+	status := "running"
+	if event.Type == "final" {
+		status = strings.TrimSpace(fmt.Sprint(event.Data["status"]))
+	}
+	if status == "" {
+		status = "running"
+	}
+	startedAt := event.Time
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	idx := m.createTaskRecord(task, status, startedAt)
+	m.activeTask = idx
+	if m.selectedTask < 0 {
+		m.setSelectedTask(idx)
+	}
+	return idx
+}
+
+func (m *model) updateTaskFromEvent(record *taskRecord, event core.Event) {
+	if record == nil {
+		return
+	}
+	switch event.Type {
+	case "user_task":
+		if text := strings.TrimSpace(fmt.Sprint(event.Data["task"])); text != "" {
+			record.Task.Text = text
+		}
+		if repo := strings.TrimSpace(fmt.Sprint(event.Data["repo"])); repo != "" {
+			record.Task.Repo = repo
+		}
+		if record.Status == "" {
+			record.Status = "running"
+		}
+		if !event.Time.IsZero() {
+			record.StartedAt = event.Time
+		}
+	case "error":
+		record.Status = "error"
+	case "final":
+		status := strings.TrimSpace(fmt.Sprint(event.Data["status"]))
+		if status == "" {
+			status = "done"
+		}
+		record.Status = status
+		record.Result.Status = status
+		record.Result.Steps = intValue(event.Data["steps"])
+		record.Result.Submission = cleanSubmission(event.Data["submission"])
+		if !event.Time.IsZero() {
+			record.FinishedAt = event.Time
+		}
+	default:
+		if record.Status == "" {
+			record.Status = "running"
+		}
+	}
+}
+
+func (m *model) updateTaskChat(record *taskRecord, event core.Event) {
+	if record == nil {
+		return
+	}
+	switch event.Type {
+	case "user_task":
+		body := strings.TrimSpace(fmt.Sprint(event.Data["task"]))
+		if body == "" {
+			return
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "user",
+			Title: "Task",
+			Body:  body,
+			Time:  event.Time,
+		})
+	case "error":
+		body := strings.TrimSpace(fmt.Sprint(event.Data["error"]))
+		if body == "" {
+			return
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "error",
+			Title: "Error",
+			Body:  body,
+			Time:  event.Time,
+		})
+	case "final":
+		record.Summary = taskSummary(*record)
+		m.upsertSummaryEntry(record, event.Time)
+	}
+}
+
+func (m *model) finishActiveTask(result agentpkg.Result, err error) {
+	record := m.activeTaskRecord()
+	if record == nil {
+		return
+	}
+	wasViewingTask := m.activeTask == m.selectedTask && m.sidebar == sidebarChat
+	follow := wasViewingTask && (m.selected == len(record.Chat)-1 || m.selected < 0)
+	record.Result = result
+	record.RunErr = err
+	record.FinishedAt = time.Now()
+	if err != nil {
+		record.Status = "error"
+	} else if strings.TrimSpace(result.Status) != "" {
+		record.Status = result.Status
+	} else {
+		record.Status = "done"
+	}
+	record.Summary = taskSummary(*record)
+	m.upsertSummaryEntry(record, time.Now())
+	if wasViewingTask && follow {
+		m.selectIndex(len(record.Chat) - 1)
+	} else if wasViewingTask {
+		m.updateDetail()
+	}
+}
+
 func (m *model) addEvent(event core.Event) {
-	follow := m.selected == len(m.events)-1 || m.selected < 0
-	m.events = append(m.events, event)
-	if isErrorFinal(event) {
-		if idx := m.lastEventIndex("error"); idx >= 0 {
-			m.selectIndex(idx)
-		} else if follow {
-			m.selectIndex(len(m.events) - 1)
+	taskIndex := m.ensureEventTask(event)
+	record := &m.tasks[taskIndex]
+	wasViewingTask := taskIndex == m.selectedTask
+	follow := wasViewingTask && m.sidebar == sidebarChat && (m.selected == len(record.Chat)-1 || m.selected < 0)
+	record.Events = append(record.Events, event)
+	m.updateTaskFromEvent(record, event)
+	m.updateTaskChat(record, event)
+
+	if wasViewingTask && m.sidebar == sidebarChat {
+		if follow || m.selected < 0 {
+			m.selectIndex(len(record.Chat) - 1)
 		} else {
 			m.updateDetail()
 		}
-	} else if follow {
-		m.selectIndex(len(m.events) - 1)
-	} else {
+	} else if wasViewingTask {
 		m.updateDetail()
 	}
 	m.status = summarizeEvent(event)
 }
 
-func (m *model) lastEventIndex(eventType string) int {
-	for i := len(m.events) - 1; i >= 0; i-- {
-		if m.events[i].Type == eventType {
-			return i
-		}
+func (m *model) moveSelection(delta int) {
+	if m.sidebar == sidebarHistory {
+		m.moveTaskSelection(delta)
+	} else {
+		m.moveChatSelection(delta)
 	}
-	return -1
 }
 
-func (m *model) moveSelection(delta int) {
-	if len(m.events) == 0 {
+func (m *model) moveChatSelection(delta int) {
+	chat := m.selectedChat()
+	if len(chat) == 0 {
 		return
 	}
-	m.selectIndex(clamp(m.selected+delta, 0, len(m.events)-1))
+	m.selectIndex(clamp(m.selected+delta, 0, len(chat)-1))
+}
+
+func (m *model) moveTaskSelection(delta int) {
+	if len(m.tasks) == 0 {
+		return
+	}
+	m.selectTaskIndex(clamp(m.selectedTask+delta, 0, len(m.tasks)-1))
 }
 
 func (m *model) selectIndex(index int) {
-	if len(m.events) == 0 {
+	chat := m.selectedChat()
+	if len(chat) == 0 {
 		m.selected = -1
+		m.saveSelectedTaskView()
+		m.updateDetail()
 		return
 	}
-	m.selected = clamp(index, 0, len(m.events)-1)
-	m.ensureTimelineVisible()
+	m.selected = clamp(index, 0, len(chat)-1)
+	m.ensureChatVisible()
+	m.saveSelectedTaskView()
 	m.updateDetail()
+}
+
+func (m *model) selectTaskIndex(index int) {
+	if len(m.tasks) == 0 {
+		m.selectedTask = -1
+		m.selected = -1
+		m.historyOffset = 0
+		m.updateDetail()
+		return
+	}
+	m.setSelectedTask(index)
+	m.ensureHistoryVisible()
+	m.updateDetail()
+}
+
+func (m *model) selectFirst() {
+	if m.sidebar == sidebarHistory {
+		m.selectTaskIndex(0)
+		return
+	}
+	m.selectIndex(0)
+}
+
+func (m *model) selectLast() {
+	if m.sidebar == sidebarHistory {
+		m.selectTaskIndex(len(m.tasks) - 1)
+		return
+	}
+	m.selectIndex(len(m.selectedChat()) - 1)
 }
 
 func (m *model) centerSelection() {
 	bodyHeight := m.bodyHeight()
-	if bodyHeight <= 0 || m.selected < 0 {
+	if bodyHeight <= 0 {
 		return
 	}
-	m.timelineOffset = max(0, m.selected-bodyHeight/2)
+	if m.sidebar == sidebarHistory {
+		if m.selectedTask >= 0 {
+			m.historyOffset = max(0, m.selectedTask-bodyHeight/2)
+		}
+		return
+	}
+	if m.selected >= 0 {
+		m.chatOffset = max(0, m.selected-bodyHeight/2)
+		m.saveSelectedTaskView()
+	}
 }
 
 func (m *model) toggleFocus() {
-	if m.focus == "timeline" {
+	if m.focus == "sidebar" {
 		m.focus = "detail"
 	} else {
-		m.focus = "timeline"
+		m.focus = "sidebar"
 	}
+}
+
+func (m *model) showHistory() {
+	m.sidebar = sidebarHistory
+	m.view = viewEvent
+	m.focus = "sidebar"
+	if len(m.tasks) > 0 && m.selectedTask < 0 {
+		m.setSelectedTask(len(m.tasks) - 1)
+	}
+	m.ensureHistoryVisible()
+	m.mode = modeNormal
+	m.command.Blur()
+	m.status = fmt.Sprintf("history: %d tasks", len(m.tasks))
+	m.updateDetail()
+}
+
+func (m *model) showChat() {
+	m.sidebar = sidebarChat
+	m.view = viewEvent
+	m.focus = "sidebar"
+	if len(m.tasks) > 0 && m.selectedTask < 0 {
+		m.setSelectedTask(len(m.tasks) - 1)
+	}
+	m.ensureChatVisible()
+	m.mode = modeNormal
+	m.command.Blur()
+	m.status = "chat for selected task"
+	m.updateDetail()
 }
 
 func (m *model) scrollDetailHalfPage(direction int) {
@@ -843,15 +1192,27 @@ func (m *model) findMatch(direction int) {
 		m.status = "no search query"
 		return
 	}
-	if len(m.events) == 0 {
-		m.status = "no events to search"
+	if m.sidebar == sidebarHistory {
+		m.findTaskMatch(direction)
+		return
+	}
+	m.findChatMatch(direction)
+}
+
+func (m *model) findChatMatch(direction int) {
+	chat := m.selectedChat()
+	if len(chat) == 0 {
+		m.status = "no chat to search"
 		return
 	}
 	needle := strings.ToLower(m.query)
 	start := m.selected
-	for i := 1; i <= len(m.events); i++ {
-		idx := (start + direction*i + len(m.events)*2) % len(m.events)
-		haystack := strings.ToLower(summarizeEvent(m.events[idx]) + "\n" + eventDetail(m.events[idx]))
+	if start < 0 {
+		start = 0
+	}
+	for i := 1; i <= len(chat); i++ {
+		idx := (start + direction*i + len(chat)*2) % len(chat)
+		haystack := strings.ToLower(chatLine(chat[idx]) + "\n" + chatDetailWidth(chat[idx], m.detail.Width))
 		if strings.Contains(haystack, needle) {
 			m.selectIndex(idx)
 			m.status = fmt.Sprintf("match %d: %s", idx+1, m.query)
@@ -861,15 +1222,41 @@ func (m *model) findMatch(direction int) {
 	m.status = "no match: " + m.query
 }
 
+func (m *model) findTaskMatch(direction int) {
+	if len(m.tasks) == 0 {
+		m.status = "no tasks to search"
+		return
+	}
+	needle := strings.ToLower(m.query)
+	start := m.selectedTask
+	if start < 0 {
+		start = 0
+	}
+	for i := 1; i <= len(m.tasks); i++ {
+		idx := (start + direction*i + len(m.tasks)*2) % len(m.tasks)
+		haystack := strings.ToLower(taskHistoryLine(m.tasks[idx]) + "\n" + taskDetailWidth(m.tasks[idx], m.detail.Width))
+		if strings.Contains(haystack, needle) {
+			m.selectTaskIndex(idx)
+			m.status = fmt.Sprintf("task match %d: %s", idx+1, m.query)
+			return
+		}
+	}
+	m.status = "no task match: " + m.query
+}
+
 func (m *model) resize() {
 	bodyWidth := max(1, m.width-2)
 	bodyHeight := max(1, m.bodyHeight())
-	detailWidth := max(20, bodyWidth-m.timelineWidth()-1)
+	detailWidth := max(20, bodyWidth-m.sidebarWidth()-1)
 	m.detail.Width = detailWidth - 2
 	m.detail.Height = bodyHeight - 2
 	m.help.Width = m.width
 	m.command.Width = max(10, m.width-4)
-	m.ensureTimelineVisible()
+	if m.sidebar == sidebarHistory {
+		m.ensureHistoryVisible()
+	} else {
+		m.ensureChatVisible()
+	}
 	m.updateDetail()
 }
 
@@ -884,26 +1271,45 @@ func (m *model) bodyHeight() int {
 	return max(1, m.height-reserved)
 }
 
-func (m *model) timelineWidth() int {
+func (m *model) sidebarWidth() int {
 	if m.width < 90 {
 		return max(28, m.width/2)
 	}
 	return max(34, min(56, m.width*42/100))
 }
 
-func (m *model) ensureTimelineVisible() {
-	bodyHeight := m.bodyHeight()
+func (m *model) ensureChatVisible() {
+	bodyHeight := m.sidebarListHeight()
 	if m.selected < 0 || bodyHeight <= 0 {
-		m.timelineOffset = 0
+		m.chatOffset = 0
 		return
 	}
-	if m.selected < m.timelineOffset {
-		m.timelineOffset = m.selected
+	if m.selected < m.chatOffset {
+		m.chatOffset = m.selected
 	}
-	if m.selected >= m.timelineOffset+bodyHeight {
-		m.timelineOffset = m.selected - bodyHeight + 1
+	if m.selected >= m.chatOffset+bodyHeight {
+		m.chatOffset = m.selected - bodyHeight + 1
 	}
-	m.timelineOffset = max(0, m.timelineOffset)
+	m.chatOffset = max(0, m.chatOffset)
+}
+
+func (m *model) ensureHistoryVisible() {
+	bodyHeight := m.sidebarListHeight()
+	if m.selectedTask < 0 || bodyHeight <= 0 {
+		m.historyOffset = 0
+		return
+	}
+	if m.selectedTask < m.historyOffset {
+		m.historyOffset = m.selectedTask
+	}
+	if m.selectedTask >= m.historyOffset+bodyHeight {
+		m.historyOffset = m.selectedTask - bodyHeight + 1
+	}
+	m.historyOffset = max(0, m.historyOffset)
+}
+
+func (m *model) sidebarListHeight() int {
+	return max(1, m.bodyHeight()-3)
 }
 
 func (m *model) updateDetail() {
@@ -913,10 +1319,11 @@ func (m *model) updateDetail() {
 func (m *model) detailContent() string {
 	switch m.view {
 	case viewDiff:
-		if m.result.Diff != "" {
-			return m.result.Diff
+		result := m.selectedResult()
+		if result.Diff != "" {
+			return result.Diff
 		}
-		if !m.done {
+		if record := m.selectedTaskRecord(); record != nil && record.Status == "running" {
 			return "Diff is available after the run finishes."
 		}
 		return "No diff."
@@ -926,19 +1333,29 @@ func (m *model) detailContent() string {
 		if m.approval != nil {
 			return approvalDetail(m.approval)
 		}
-		if m.selected >= 0 && m.selected < len(m.events) {
-			return eventDetailWidth(m.events[m.selected], m.detail.Width)
+		if m.sidebar == sidebarHistory {
+			if record := m.selectedTaskRecord(); record != nil {
+				return taskDetailWidth(*record, m.detail.Width)
+			}
+			return "No task history yet."
+		}
+		chat := m.selectedChat()
+		if m.selected >= 0 && m.selected < len(chat) {
+			return chatDetailWidth(chat[m.selected], m.detail.Width)
+		}
+		if record := m.selectedTaskRecord(); record != nil {
+			return taskDetailWidth(*record, m.detail.Width)
 		}
 		if m.loop && !m.running {
-			return "Type a task below to start.\n\nSlash commands: /clear, /quit, /help, /trace, /open-trace."
+			return "Type a task below to start.\n\nSlash commands: /history, /clear, /quit, /help, /trace, /open-trace."
 		}
 		return "Waiting for events..."
 	}
 }
 
 func (m *model) trajectoryPath() string {
-	if m.result.TrajectoryPath != "" {
-		return m.result.TrajectoryPath
+	if result := m.selectedResult(); result.TrajectoryPath != "" {
+		return result.TrajectoryPath
 	}
 	if m.agent != nil && m.agent.Trajectory != nil {
 		return m.agent.Trajectory.Path()
@@ -978,10 +1395,11 @@ func (m *model) headerView() string {
 		state = "approval"
 	}
 	elapsed := time.Since(m.startedAt).Round(time.Second)
-	title := fmt.Sprintf(" swe-agent  %s %s  step %d  %s  %s ",
-		m.spinner.View(), state, len(m.events), m.modelLabel(), elapsed)
+	taskLabel := fmt.Sprintf("task %d/%d", max(0, m.selectedTask+1), len(m.tasks))
+	title := fmt.Sprintf(" swe-agent  %s %s  %s  chat %d  %s  %s ",
+		m.spinner.View(), state, taskLabel, len(m.selectedChat()), m.modelLabel(), elapsed)
 	if m.done {
-		title = fmt.Sprintf(" swe-agent  %s  steps %d  %s ", m.result.Status, m.result.Steps, elapsed)
+		title = fmt.Sprintf(" swe-agent  %s  %s  steps %d  %s ", m.result.Status, taskLabel, m.result.Steps, elapsed)
 	}
 	return headerStyle.Width(m.width).Render(truncate(title, m.width))
 }
@@ -1003,41 +1421,89 @@ func (m *model) modelLabel() string {
 
 func (m *model) bodyView() string {
 	bodyHeight := m.bodyHeight()
-	timelineWidth := m.timelineWidth()
-	detailWidth := max(20, m.width-timelineWidth-1)
+	sidebarWidth := m.sidebarWidth()
+	detailWidth := max(20, m.width-sidebarWidth-1)
 
-	timeline := panelStyle.
-		Width(timelineWidth).
+	sidebar := panelStyle.
+		Width(sidebarWidth).
 		Height(bodyHeight).
-		BorderForeground(focusColor(m.focus == "timeline")).
-		Render(m.timelineView(timelineWidth-2, bodyHeight-2))
+		BorderForeground(focusColor(m.focus == "sidebar")).
+		Render(m.sidebarView(sidebarWidth-2, bodyHeight-2))
 	detail := panelStyle.
 		Width(detailWidth).
 		Height(bodyHeight).
 		BorderForeground(focusColor(m.focus == "detail")).
 		Render(m.detail.View())
-	return lipgloss.JoinHorizontal(lipgloss.Top, timeline, detail)
+	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, detail)
 }
 
-func (m *model) timelineView(width, height int) string {
-	if len(m.events) == 0 {
-		if m.loop && !m.running {
-			return mutedStyle.Render("No events yet. Enter a task below.")
-		}
-		return mutedStyle.Render("Waiting for agent events...")
+func (m *model) sidebarView(width, height int) string {
+	if m.sidebar == sidebarHistory {
+		return m.historyView(width, height)
 	}
-	lines := make([]string, 0, height)
-	end := min(len(m.events), m.timelineOffset+height)
-	for i := m.timelineOffset; i < end; i++ {
-		event := m.events[i]
+	return m.chatView(width, height)
+}
+
+func (m *model) chatView(width, height int) string {
+	title := "Chat"
+	if record := m.selectedTaskRecord(); record != nil {
+		title = fmt.Sprintf("Task #%d chat", record.ID)
+	}
+	if height <= 0 {
+		return ""
+	}
+	lines := []string{sidebarTitleStyle.Render(truncate(title, width))}
+	listHeight := max(0, height-1)
+	chat := m.selectedChat()
+	if len(chat) == 0 {
+		message := "Waiting for agent summary..."
+		if m.loop && !m.running {
+			message = "No active task. Enter a task below."
+		}
+		lines = append(lines, mutedStyle.Render(truncate(message, width)))
+		for len(lines) < height {
+			lines = append(lines, "")
+		}
+		return strings.Join(lines, "\n")
+	}
+	end := min(len(chat), m.chatOffset+listHeight)
+	for i := m.chatOffset; i < end; i++ {
 		prefix := "  "
-		style := timelineStyle
+		style := sidebarItemStyle
 		if i == m.selected {
 			prefix = "> "
 			style = selectedStyle
 		}
-		line := fmt.Sprintf("%s %s", event.Time.Format("15:04:05"), summarizeEvent(event))
-		lines = append(lines, style.Render(truncate(prefix+line, width)))
+		lines = append(lines, style.Render(truncate(prefix+chatLine(chat[i]), width)))
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) historyView(width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := []string{sidebarTitleStyle.Render(truncate(fmt.Sprintf("History (%d tasks)", len(m.tasks)), width))}
+	listHeight := max(0, height-1)
+	if len(m.tasks) == 0 {
+		lines = append(lines, mutedStyle.Render(truncate("No task history yet. Enter a task below.", width)))
+		for len(lines) < height {
+			lines = append(lines, "")
+		}
+		return strings.Join(lines, "\n")
+	}
+	end := min(len(m.tasks), m.historyOffset+listHeight)
+	for i := m.historyOffset; i < end; i++ {
+		prefix := "  "
+		style := sidebarItemStyle
+		if i == m.selectedTask {
+			prefix = "> "
+			style = selectedStyle
+		}
+		lines = append(lines, style.Render(truncate(prefix+taskHistoryLine(m.tasks[i]), width)))
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
@@ -1089,11 +1555,11 @@ func (m *model) shortHelp() []key.Binding {
 	case modeApproval:
 		return []key.Binding{keyAllow, keyDeny, keyRemember, keyHelp}
 	case modeTask:
-		return []key.Binding{keyEnter, keySlashClear, keyEsc}
+		return []key.Binding{keyEnter, keySlashHistory, keySlashClear, keyEsc}
 	case modeCommand, modeSearch:
 		return []key.Binding{keyEnter, keyEsc}
 	default:
-		return []key.Binding{keyMove, keyOpen, keyTaskInput, keyCommand, keySearch, keyHelp, keyQuit}
+		return []key.Binding{keyMove, keyOpen, keyTaskInput, keyHistory, keyCommand, keySearch, keyHelp, keyQuit}
 	}
 }
 
@@ -1102,8 +1568,8 @@ func (m *model) fullHelp() [][]key.Binding {
 		{keyMove, keyLeftRight, keyTop, keyBottom, keyCenter},
 		{keyScrollHalf, keyScrollPage, keyTab, keyOpen},
 		{keySearch, keyNext, keyPrev, keyCommand, keyHelp},
-		{keyDiff, keyTimeline, keyTrace, keyOpenTrace},
-		{keyTaskInput, keySlashClear, keySlashQuit},
+		{keyDiff, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
+		{keyTaskInput, keySlashHistory, keySlashClear, keySlashQuit},
 		{keyAllow, keyDeny, keyRemember, keyExpandApproval},
 		{keyQuit, keyCancel},
 	}
@@ -1140,34 +1606,282 @@ func eventDetail(event core.Event) string {
 }
 
 func eventDetailWidth(event core.Event, width int) string {
-	var b bytes.Buffer
-	fmt.Fprintf(&b, "type: %s\n", event.Type)
+	var b strings.Builder
+	b.WriteString("Event\n")
+	writeField(&b, "Type", event.Type, width)
 	if !event.Time.IsZero() {
-		fmt.Fprintf(&b, "time: %s\n", event.Time.Format(time.RFC3339))
+		writeField(&b, "Time", event.Time.Format(time.RFC3339), width)
 	}
-	if event.Type == "error" {
-		if errText := strings.TrimSpace(fmt.Sprint(event.Data["error"])); errText != "" {
-			b.WriteString("\nerror:\n")
-			b.WriteString(wrapText(errText, width))
-			b.WriteByte('\n')
-			return b.String()
+
+	switch event.Type {
+	case "user_task":
+		writeSection(&b, "Task")
+		writeField(&b, "Task", event.Data["task"], width)
+		writeField(&b, "Repository", event.Data["repo"], width)
+	case "model_request":
+		writeSection(&b, "Request")
+		writeField(&b, "Step", event.Data["step"], width)
+		writeField(&b, "Messages", event.Data["messages"], width)
+	case "model_response":
+		writeSection(&b, "Response")
+		writeField(&b, "Step", event.Data["step"], width)
+		writeField(&b, "Content", event.Data["content"], width)
+		if usage, ok := event.Data["usage"]; ok {
+			writeSection(&b, "Usage")
+			writeValueTree(&b, "", usage, 0, width)
+		}
+	case "tool_call":
+		writeSection(&b, "Tool Call")
+		writeField(&b, "Tool", event.Data["tool"], width)
+		if args, ok := event.Data["args"]; ok {
+			writeSection(&b, "Arguments")
+			writeValueTree(&b, "", args, 0, width)
+		}
+	case "tool_result":
+		writeSection(&b, "Tool Result")
+		writeField(&b, "Tool", event.Data["tool"], width)
+		writeField(&b, "Code", event.Data["code"], width)
+		writeField(&b, "Timed Out", event.Data["timed_out"], width)
+		writeField(&b, "Output", event.Data["output"], width)
+	case "tool_denied":
+		writeSection(&b, "Denied Tool")
+		writeField(&b, "Tool", event.Data["tool"], width)
+		writeField(&b, "Reason", event.Data["reason"], width)
+	case "error":
+		writeSection(&b, "Error")
+		writeField(&b, "Error", event.Data["error"], width)
+	case "final":
+		writeSection(&b, "Final Result")
+		writeField(&b, "Status", event.Data["status"], width)
+		writeField(&b, "Steps", event.Data["steps"], width)
+		writeField(&b, "Submission", event.Data["submission"], width)
+	default:
+		if len(event.Data) > 0 {
+			writeSection(&b, "Data")
+			writeValueTree(&b, "", event.Data, 0, width)
 		}
 	}
-	if len(event.Data) > 0 {
-		b.WriteString("\ndata:\n")
-		data, err := json.MarshalIndent(event.Data, "", "  ")
-		if err != nil {
-			fmt.Fprintf(&b, "%v\n", event.Data)
-		} else {
-			b.Write(data)
-			b.WriteByte('\n')
-		}
-	}
+
 	return b.String()
 }
 
-func isErrorFinal(event core.Event) bool {
-	return event.Type == "final" && fmt.Sprint(event.Data["status"]) == "error"
+func chatLine(entry chatEntry) string {
+	role := valueOrDefault(entry.Title, valueOrDefault(entry.Role, "Message"))
+	body := shortString(entry.Body, 56)
+	if body == "" {
+		body = "(empty)"
+	}
+	if entry.Time.IsZero() {
+		return fmt.Sprintf("%-10s %s", role, body)
+	}
+	return fmt.Sprintf("%s %-10s %s", entry.Time.Format("15:04:05"), role, body)
+}
+
+func chatDetailWidth(entry chatEntry, width int) string {
+	title := valueOrDefault(entry.Title, valueOrDefault(entry.Role, "Message"))
+	var b strings.Builder
+	b.WriteString(title)
+	b.WriteString("\n\n")
+	if !entry.Time.IsZero() {
+		writeField(&b, "Time", entry.Time.Format(time.RFC3339), width)
+		b.WriteByte('\n')
+	}
+	body := strings.TrimSpace(entry.Body)
+	if body == "" {
+		body = "No content."
+	}
+	b.WriteString(wrapText(body, width))
+	b.WriteByte('\n')
+	return b.String()
+}
+
+func taskSummary(record taskRecord) string {
+	status := valueOrDefault(record.Status, "pending")
+	steps := record.Result.Steps
+	if steps == 0 {
+		steps = intValue(lastEventData(record.Events, "final", "steps"))
+	}
+	conclusion := taskConclusion(record)
+	errText := strings.TrimSpace(lastErrorText(record))
+	stepText := "without any recorded steps"
+	if steps == 1 {
+		stepText = "after 1 step"
+	} else if steps > 1 {
+		stepText = fmt.Sprintf("after %d steps", steps)
+	}
+
+	switch {
+	case errText != "":
+		return fmt.Sprintf("Task finished with status %s %s. Error: %s", status, stepText, errText)
+	case conclusion != "":
+		return fmt.Sprintf("Task finished with status %s %s. Agent summary: %s", status, stepText, conclusion)
+	case record.Result.Diff != "":
+		return fmt.Sprintf("Task finished with status %s %s. A workspace diff is available; press d to inspect it.", status, stepText)
+	case status == "running":
+		return "Task is still running. The agent summary will appear here when it finishes."
+	default:
+		return fmt.Sprintf("Task finished with status %s %s. No final summary text was submitted.", status, stepText)
+	}
+}
+
+func taskConclusion(record taskRecord) string {
+	if submission := cleanSubmission(record.Result.Submission); submission != "" {
+		return submission
+	}
+	if submission := cleanSubmission(lastEventData(record.Events, "final", "submission")); submission != "" {
+		return submission
+	}
+	for i := len(record.Events) - 1; i >= 0; i-- {
+		event := record.Events[i]
+		if event.Type != "tool_call" || fmt.Sprint(event.Data["tool"]) != "submit" {
+			continue
+		}
+		if args, ok := normalizeValue(event.Data["args"]).(map[string]any); ok {
+			if submission := cleanSubmission(args["submission"]); submission != "" {
+				return submission
+			}
+		}
+	}
+	return lastAssistantConclusion(record)
+}
+
+func cleanSubmission(value any) string {
+	if value == nil {
+		return ""
+	}
+	submission := strings.TrimSpace(fmt.Sprint(value))
+	if submission == "" || submission == "<nil>" || strings.EqualFold(submission, "submitted") {
+		return ""
+	}
+	return submission
+}
+
+func lastAssistantConclusion(record taskRecord) string {
+	for i := len(record.Events) - 1; i >= 0; i-- {
+		event := record.Events[i]
+		if event.Type != "model_response" {
+			continue
+		}
+		content := stripFencedBlocks(strings.TrimSpace(fmt.Sprint(event.Data["content"])))
+		if content != "" {
+			return content
+		}
+	}
+	return ""
+}
+
+func stripFencedBlocks(value string) string {
+	return strings.TrimSpace(fencedBlockPattern.ReplaceAllString(value, ""))
+}
+
+func (m *model) upsertSummaryEntry(record *taskRecord, at time.Time) {
+	if record == nil {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	entry := chatEntry{
+		Role:  "summary",
+		Title: "Summary",
+		Body:  valueOrDefault(record.Summary, taskSummary(*record)),
+		Time:  at,
+	}
+	for i := len(record.Chat) - 1; i >= 0; i-- {
+		if record.Chat[i].Role == "summary" {
+			record.Chat[i] = entry
+			return
+		}
+	}
+	record.Chat = append(record.Chat, entry)
+}
+
+func lastErrorText(record taskRecord) string {
+	if record.RunErr != nil {
+		return record.RunErr.Error()
+	}
+	value := lastEventData(record.Events, "error", "error")
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func lastEventData(events []core.Event, eventType string, key string) any {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == eventType {
+			if events[i].Data == nil {
+				return nil
+			}
+			return events[i].Data[key]
+		}
+	}
+	return nil
+}
+
+func taskHistoryLine(record taskRecord) string {
+	status := strings.TrimSpace(record.Status)
+	if status == "" {
+		status = "pending"
+	}
+	text := shortString(record.Task.Text, 48)
+	if text == "" {
+		text = "(empty task)"
+	}
+	return fmt.Sprintf("#%d %-10s %s", record.ID, status, text)
+}
+
+func taskDetailWidth(record taskRecord, width int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Task #%d\n", record.ID)
+	writeField(&b, "Status", valueOrDefault(record.Status, "pending"), width)
+	writeField(&b, "Repository", record.Task.Repo, width)
+	writeField(&b, "Task", record.Task.Text, width)
+	if !record.StartedAt.IsZero() {
+		writeField(&b, "Started", record.StartedAt.Format(time.RFC3339), width)
+	}
+	if !record.FinishedAt.IsZero() {
+		writeField(&b, "Finished", record.FinishedAt.Format(time.RFC3339), width)
+	}
+	if duration := taskDuration(record); duration != "" {
+		writeField(&b, "Duration", duration, width)
+	}
+	if summary := strings.TrimSpace(record.Summary); summary != "" {
+		writeSection(&b, "Summary")
+		b.WriteString(wrapText(summary, width))
+		b.WriteByte('\n')
+	}
+
+	writeSection(&b, "Result")
+	if record.Result.Status == "" && record.Result.Steps == 0 && record.RunErr == nil {
+		b.WriteString("No result yet.\n")
+	} else {
+		writeField(&b, "Status", record.Result.Status, width)
+		writeField(&b, "Steps", record.Result.Steps, width)
+		if usage := record.Result.Usage; usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.CostUSD != 0 {
+			writeField(&b, "Input Tokens", usage.InputTokens, width)
+			writeField(&b, "Output Tokens", usage.OutputTokens, width)
+			writeField(&b, "Cost USD", usage.CostUSD, width)
+		}
+		writeField(&b, "Trajectory", record.Result.TrajectoryPath, width)
+		if record.RunErr != nil {
+			writeField(&b, "Error", record.RunErr.Error(), width)
+		}
+		if conclusion := taskConclusion(record); conclusion != "" {
+			writeSection(&b, "Submission")
+			writeField(&b, "Text", conclusion, width)
+		}
+		if record.Result.Diff != "" {
+			writeField(&b, "Diff", summarizeDiff(record.Result.Diff), width)
+		}
+	}
+
+	writeSection(&b, "Events")
+	writeField(&b, "Count", len(record.Events), width)
+	if len(record.Events) > 0 {
+		writeField(&b, "Last", summarizeEvent(record.Events[len(record.Events)-1]), width)
+	}
+	return b.String()
 }
 
 func approvalDetail(state *approvalState) string {
@@ -1184,22 +1898,250 @@ func approvalDetail(state *approvalState) string {
 
 func formatArgs(args map[string]any) string {
 	if len(args) == 0 {
-		return "{}"
+		return "empty"
 	}
-	keys := make([]string, 0, len(args))
-	for key := range args {
-		keys = append(keys, key)
+	var b strings.Builder
+	writeValueTree(&b, "", args, 0, 0)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func writeSection(b *strings.Builder, title string) {
+	if b.Len() > 0 && !strings.HasSuffix(b.String(), "\n\n") {
+		b.WriteByte('\n')
 	}
-	sort.Strings(keys)
-	ordered := map[string]any{}
-	for _, key := range keys {
-		ordered[key] = args[key]
+	b.WriteString(title)
+	b.WriteByte('\n')
+}
+
+func writeField(b *strings.Builder, key string, value any, width int) {
+	text := strings.TrimSpace(formatScalar(normalizeValue(value)))
+	if text == "" {
+		return
 	}
-	data, err := json.MarshalIndent(ordered, "", "  ")
-	if err != nil {
-		return fmt.Sprint(args)
+	if strings.Contains(text, "\n") || (width > 0 && len([]rune(key+": "+text)) > width) {
+		fmt.Fprintf(b, "%s:\n", key)
+		b.WriteString(indentText(wrapText(text, remainingWidth(width, 2)), 2))
+		b.WriteByte('\n')
+		return
 	}
-	return string(data)
+	fmt.Fprintf(b, "%s: %s\n", key, text)
+}
+
+func writeValueTree(b *strings.Builder, key string, value any, indent int, width int) {
+	value = normalizeValue(value)
+	prefix := strings.Repeat("  ", indent)
+	switch typed := value.(type) {
+	case map[string]any:
+		if key != "" {
+			if len(typed) == 0 {
+				fmt.Fprintf(b, "%s%s: empty\n", prefix, key)
+				return
+			}
+			fmt.Fprintf(b, "%s%s:\n", prefix, key)
+			indent++
+			prefix = strings.Repeat("  ", indent)
+		}
+		keys := make([]string, 0, len(typed))
+		for childKey := range typed {
+			keys = append(keys, childKey)
+		}
+		sort.Strings(keys)
+		for _, childKey := range keys {
+			writeValueTree(b, childKey, typed[childKey], indent, width)
+		}
+	case []any:
+		if key != "" {
+			if len(typed) == 0 {
+				fmt.Fprintf(b, "%s%s: empty list\n", prefix, key)
+				return
+			}
+			fmt.Fprintf(b, "%s%s:\n", prefix, key)
+		}
+		for _, item := range typed {
+			writeListItem(b, item, indent+1, width)
+		}
+	default:
+		text := strings.TrimSpace(formatScalar(typed))
+		if text == "" {
+			return
+		}
+		if key == "" {
+			b.WriteString(indentText(wrapText(text, remainingWidth(width, len(prefix))), indent*2))
+			b.WriteByte('\n')
+			return
+		}
+		line := fmt.Sprintf("%s%s: %s", prefix, key, text)
+		if width > 0 && len([]rune(line)) > width {
+			fmt.Fprintf(b, "%s%s:\n", prefix, key)
+			b.WriteString(indentText(wrapText(text, remainingWidth(width, len(prefix)+2)), indent*2+2))
+			b.WriteByte('\n')
+			return
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+}
+
+func writeListItem(b *strings.Builder, value any, indent int, width int) {
+	value = normalizeValue(value)
+	prefix := strings.Repeat("  ", indent)
+	switch typed := value.(type) {
+	case map[string]any:
+		fmt.Fprintf(b, "%s-\n", prefix)
+		writeValueTree(b, "", typed, indent+1, width)
+	case []any:
+		fmt.Fprintf(b, "%s-\n", prefix)
+		writeValueTree(b, "", typed, indent+1, width)
+	default:
+		text := strings.TrimSpace(formatScalar(typed))
+		if text == "" {
+			return
+		}
+		line := fmt.Sprintf("%s- %s", prefix, text)
+		if width > 0 && len([]rune(line)) > width {
+			fmt.Fprintf(b, "%s-\n", prefix)
+			b.WriteString(indentText(wrapText(text, remainingWidth(width, len(prefix)+2)), indent*2+2))
+			b.WriteByte('\n')
+			return
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+}
+
+func normalizeValue(value any) any {
+	switch typed := value.(type) {
+	case nil, string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return typed
+	case map[string]any, []any:
+		return typed
+	default:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		var out any
+		if err := json.Unmarshal(data, &out); err != nil {
+			return fmt.Sprint(typed)
+		}
+		return out
+	}
+}
+
+func formatScalar(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case bool:
+		return fmt.Sprint(typed)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprint(typed)
+	case float32:
+		return formatFloat(float64(typed))
+	case float64:
+		return formatFloat(typed)
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func formatFloat(value float64) string {
+	if value == float64(int64(value)) {
+		return fmt.Sprintf("%.0f", value)
+	}
+	return fmt.Sprintf("%g", value)
+}
+
+func indentText(text string, spaces int) string {
+	if text == "" {
+		return ""
+	}
+	prefix := strings.Repeat(" ", spaces)
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = prefix + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func remainingWidth(width int, used int) int {
+	if width <= 0 {
+		return 0
+	}
+	return max(1, width-used)
+}
+
+func valueOrDefault(value string, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func taskDuration(record taskRecord) string {
+	if record.StartedAt.IsZero() {
+		return ""
+	}
+	end := record.FinishedAt
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if end.Before(record.StartedAt) {
+		return ""
+	}
+	return end.Sub(record.StartedAt).Round(time.Second).String()
+}
+
+func summarizeDiff(diff string) string {
+	lines := 0
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines++
+		}
+	}
+	if lines == 0 {
+		return "empty"
+	}
+	return fmt.Sprintf("%d non-empty lines; press d for full diff", lines)
+}
+
+func intValue(value any) int {
+	switch typed := normalizeValue(value).(type) {
+	case int:
+		return typed
+	case int8:
+		return int(typed)
+	case int16:
+		return int(typed)
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case uint:
+		return int(typed)
+	case uint8:
+		return int(typed)
+	case uint16:
+		return int(typed)
+	case uint32:
+		return int(typed)
+	case uint64:
+		return int(typed)
+	case float32:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case string:
+		i, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return i
+	default:
+		return 0
+	}
 }
 
 func shortString(value any, limit int) string {
@@ -1296,6 +2238,8 @@ func focusColor(focused bool) lipgloss.Color {
 	return colorBorder
 }
 
+var fencedBlockPattern = regexp.MustCompile("(?s)```(?:swe_shell|bash|sh|shell)?\\s*\\n.*?\\n```")
+
 var (
 	colorAccent = lipgloss.Color("39")
 	colorBorder = lipgloss.Color("238")
@@ -1314,8 +2258,11 @@ var (
 			Foreground(lipgloss.Color("250"))
 	mutedStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
-	timelineStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("252"))
+	sidebarTitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250")).
+				Bold(true)
+	sidebarItemStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
 	selectedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("15")).
 			Background(lipgloss.Color("31"))
@@ -1344,9 +2291,11 @@ var (
 	keyCommand        = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
 	keyHelp           = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
 	keyDiff           = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
-	keyTimeline       = key.NewBinding(key.WithKeys("t", ":timeline"), key.WithHelp("t", "timeline"))
+	keyTimeline       = key.NewBinding(key.WithKeys("t", ":chat", ":timeline"), key.WithHelp("t", "chat"))
+	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
 	keyTrace          = key.NewBinding(key.WithKeys(":trace"), key.WithHelp(":trace", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
+	keySlashHistory   = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
 	keySlashClear     = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
 	keySlashQuit      = key.NewBinding(key.WithKeys("/quit"), key.WithHelp("/quit", "quit"))
 	keyAllow          = key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "allow"))

@@ -25,8 +25,5 @@ func (Submit) Risk() core.RiskLevel { return core.RiskRead }
 
 func (Submit) Execute(ctx context.Context, input core.ToolInput) (core.ToolResult, error) {
 	submission := stringArg(input.Call.Args, "submission")
-	if submission == "" {
-		submission = "submitted"
-	}
 	return core.ToolResult{Output: "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n" + submission + "\n"}, nil
 }
