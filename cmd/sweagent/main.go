@@ -149,6 +149,8 @@ func buildAgent(opts agentOptions, interactive bool) (*agentpkg.Agent, *tui.Sess
 	}
 	if opts.modelName != "" {
 		cfg.Model.Model = opts.modelName
+	} else if usesCodexDefaultModel(cfg.Model.Provider, cfg.Model.Model) {
+		cfg.Model.Model = ""
 	}
 	if opts.trajectoryDir != "" {
 		cfg.Trajectory.Dir = opts.trajectoryDir
@@ -244,6 +246,15 @@ func configCommand(args []string) error {
 	}
 	fmt.Print(string(data))
 	return nil
+}
+
+func usesCodexDefaultModel(provider, modelName string) bool {
+	switch strings.ToLower(provider) {
+	case "codex", "codex-cli", "local-codex":
+		return modelName == "mock"
+	default:
+		return false
+	}
 }
 
 func buildModel(cfg agentpkg.Config, mockResponses string) (core.Model, error) {
