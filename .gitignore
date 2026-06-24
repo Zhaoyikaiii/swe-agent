@@ -1,3 +1,4 @@
 trajectories/
 **/trajectories/
 /sweagent
+/bin/
