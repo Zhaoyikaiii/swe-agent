@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,5 +75,48 @@ func TestStartRunFromLoopPreparesActiveTask(t *testing.T) {
 	}
 	if model.cancel == nil {
 		t.Fatal("expected active cancel function")
+	}
+}
+
+func TestErrorDetailShowsRawErrorText(t *testing.T) {
+	event := core.Event{
+		Type: "error",
+		Data: map[string]any{
+			"error": "model complete: codex exec failed\nstderr=OpenAI Codex\nERROR: unsupported model",
+		},
+	}
+
+	detail := eventDetailWidth(event, 40)
+
+	if !strings.Contains(detail, "error:\nmodel complete: codex exec failed\nstderr=OpenAI Codex\nERROR: unsupported model") {
+		t.Fatalf("expected raw multiline error text, got:\n%s", detail)
+	}
+	if strings.Contains(detail, "\\n") {
+		t.Fatalf("expected error newlines to be rendered, got escaped data:\n%s", detail)
+	}
+}
+
+func TestErrorFinalKeepsErrorEventSelected(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.detail.Width = 80
+
+	model.addEvent(core.Event{Type: "error", Data: map[string]any{"error": "codex failed with stderr"}})
+	model.addEvent(core.Event{Type: "final", Data: map[string]any{"status": "error", "steps": 1}})
+
+	if model.selected != 0 {
+		t.Fatalf("expected error event to remain selected, got index %d", model.selected)
+	}
+	if !strings.Contains(model.detailContent(), "codex failed with stderr") {
+		t.Fatalf("expected visible error detail, got:\n%s", model.detailContent())
+	}
+}
+
+func TestModelLabelShowsProviderDefaultWhenModelIsEmpty(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.agent.Config.Model.Provider = "codex-cli"
+	model.agent.Config.Model.Model = ""
+
+	if got := model.modelLabel(); got != "codex-cli:default" {
+		t.Fatalf("expected codex-cli default label, got %q", got)
 	}
 }

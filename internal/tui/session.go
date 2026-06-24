@@ -764,12 +764,29 @@ func (m *model) answerApproval(decision policy.ApprovalDecision) {
 func (m *model) addEvent(event core.Event) {
 	follow := m.selected == len(m.events)-1 || m.selected < 0
 	m.events = append(m.events, event)
-	if follow {
+	if isErrorFinal(event) {
+		if idx := m.lastEventIndex("error"); idx >= 0 {
+			m.selectIndex(idx)
+		} else if follow {
+			m.selectIndex(len(m.events) - 1)
+		} else {
+			m.updateDetail()
+		}
+	} else if follow {
 		m.selectIndex(len(m.events) - 1)
 	} else {
 		m.updateDetail()
 	}
 	m.status = summarizeEvent(event)
+}
+
+func (m *model) lastEventIndex(eventType string) int {
+	for i := len(m.events) - 1; i >= 0; i-- {
+		if m.events[i].Type == eventType {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m *model) moveSelection(delta int) {
@@ -910,7 +927,7 @@ func (m *model) detailContent() string {
 			return approvalDetail(m.approval)
 		}
 		if m.selected >= 0 && m.selected < len(m.events) {
-			return eventDetail(m.events[m.selected])
+			return eventDetailWidth(m.events[m.selected], m.detail.Width)
 		}
 		if m.loop && !m.running {
 			return "Type a task below to start.\n\nSlash commands: /clear, /quit, /help, /trace, /open-trace."
@@ -961,16 +978,27 @@ func (m *model) headerView() string {
 		state = "approval"
 	}
 	elapsed := time.Since(m.startedAt).Round(time.Second)
-	modelName := ""
-	if m.agent != nil {
-		modelName = m.agent.Config.Model.Model
-	}
 	title := fmt.Sprintf(" swe-agent  %s %s  step %d  %s  %s ",
-		m.spinner.View(), state, len(m.events), modelName, elapsed)
+		m.spinner.View(), state, len(m.events), m.modelLabel(), elapsed)
 	if m.done {
 		title = fmt.Sprintf(" swe-agent  %s  steps %d  %s ", m.result.Status, m.result.Steps, elapsed)
 	}
 	return headerStyle.Width(m.width).Render(truncate(title, m.width))
+}
+
+func (m *model) modelLabel() string {
+	if m.agent == nil {
+		return ""
+	}
+	modelName := strings.TrimSpace(m.agent.Config.Model.Model)
+	if modelName != "" {
+		return modelName
+	}
+	provider := strings.TrimSpace(m.agent.Config.Model.Provider)
+	if provider == "" {
+		return ""
+	}
+	return provider + ":default"
 }
 
 func (m *model) bodyView() string {
@@ -1108,10 +1136,22 @@ func summarizeEvent(event core.Event) string {
 }
 
 func eventDetail(event core.Event) string {
+	return eventDetailWidth(event, 0)
+}
+
+func eventDetailWidth(event core.Event, width int) string {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "type: %s\n", event.Type)
 	if !event.Time.IsZero() {
 		fmt.Fprintf(&b, "time: %s\n", event.Time.Format(time.RFC3339))
+	}
+	if event.Type == "error" {
+		if errText := strings.TrimSpace(fmt.Sprint(event.Data["error"])); errText != "" {
+			b.WriteString("\nerror:\n")
+			b.WriteString(wrapText(errText, width))
+			b.WriteByte('\n')
+			return b.String()
+		}
 	}
 	if len(event.Data) > 0 {
 		b.WriteString("\ndata:\n")
@@ -1124,6 +1164,10 @@ func eventDetail(event core.Event) string {
 		}
 	}
 	return b.String()
+}
+
+func isErrorFinal(event core.Event) bool {
+	return event.Type == "final" && fmt.Sprint(event.Data["status"]) == "error"
 }
 
 func approvalDetail(state *approvalState) string {
@@ -1162,6 +1206,43 @@ func shortString(value any, limit int) string {
 	s := strings.TrimSpace(fmt.Sprint(value))
 	s = strings.ReplaceAll(s, "\n", " ")
 	return truncate(s, limit)
+}
+
+func wrapText(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		out = append(out, wrapLine(line, width)...)
+	}
+	return strings.Join(out, "\n")
+}
+
+func wrapLine(line string, width int) []string {
+	if width <= 0 || len([]rune(line)) <= width {
+		return []string{line}
+	}
+	runes := []rune(line)
+	lines := make([]string, 0, len(runes)/width+1)
+	for len(runes) > width {
+		breakAt := width
+		for i := width; i > 0; i-- {
+			if runes[i-1] == ' ' || runes[i-1] == '\t' {
+				breakAt = i
+				break
+			}
+		}
+		part := strings.TrimRight(string(runes[:breakAt]), " \t")
+		if part == "" {
+			part = string(runes[:width])
+			breakAt = width
+		}
+		lines = append(lines, part)
+		runes = []rune(strings.TrimLeft(string(runes[breakAt:]), " \t"))
+	}
+	lines = append(lines, string(runes))
+	return lines
 }
 
 func truncate(s string, limit int) string {
