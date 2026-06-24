@@ -12,8 +12,9 @@ CONFIG ?= configs/default.yaml
 REPO ?= .
 TASK ?= finish immediately
 ARGS ?=
+SMOKE_ARGS ?=
 
-.PHONY: help fmt vet test test-race tidy check build run run-json tools config clean
+.PHONY: help fmt vet test test-race tidy check build smoke run run-json tools config clean
 
 help: ## Show available make targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -38,6 +39,9 @@ check: fmt vet test ## Run formatting, vet, and tests.
 build: ## Build the sweagent binary into BIN_DIR.
 	mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/$(BINARY) $(CMD)
+
+smoke: build ## Build and launch the TUI with the local Codex CLI provider.
+	./$(BIN_DIR)/$(BINARY) tui --model-provider codex-cli $(SMOKE_ARGS)
 
 run: ## Run a mock SWE-agent task. Override TASK, REPO, CONFIG, and ARGS as needed.
 	$(GO) run $(CMD) run --config $(CONFIG) --task "$(TASK)" --repo $(REPO) $(ARGS)

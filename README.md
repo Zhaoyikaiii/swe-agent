@@ -7,6 +7,7 @@
 ```bash
 go test ./...
 go run ./cmd/sweagent
+make smoke
 go run ./cmd/sweagent tools
 go run ./cmd/sweagent run --task "finish immediately" --repo . --json
 ```
@@ -29,7 +30,6 @@ OPENAI_API_KEY=... go run ./cmd/sweagent run \
 ```bash
 go run ./cmd/sweagent run \
   --model-provider codex-cli \
-  --model gpt-5 \
   --task "fix the failing test" \
   --repo . \
   --auto-approve
@@ -40,7 +40,6 @@ go run ./cmd/sweagent run \
 ```yaml
 model:
   provider: codex-cli
-  model: gpt-5
   command: codex
   sandbox: read-only
   approval_policy: never
