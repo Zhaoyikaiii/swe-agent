@@ -18,6 +18,7 @@ import (
 	localruntime "github.com/local/swe-agent/internal/runtime"
 	"github.com/local/swe-agent/internal/tool"
 	"github.com/local/swe-agent/internal/trajectory"
+	"github.com/local/swe-agent/internal/tui"
 	"github.com/local/swe-agent/internal/workspace"
 	"gopkg.in/yaml.v3"
 )
@@ -60,9 +61,13 @@ func runCommand(args []string) error {
 	trajectoryDir := fs.String("trajectory-dir", "", "override trajectory output directory")
 	autoApprove := fs.Bool("auto-approve", false, "auto approve read/write/exec tools")
 	jsonOutput := fs.Bool("json", false, "print result as JSON")
+	tuiMode := fs.Bool("tui", false, "run with an interactive terminal UI")
 	mockResponses := fs.String("mock-response", "", "mock model response; repeat actions with ||| separator")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *tuiMode && *jsonOutput {
+		return errors.New("--tui and --json cannot be used together")
 	}
 	task, err := resolveTask(*taskText, *taskFile)
 	if err != nil {
@@ -104,32 +109,55 @@ func runCommand(args []string) error {
 		return err
 	}
 
+	var runnerPolicy core.Policy = policy.NewSimple(cfg.Policy)
+	var eventSink agentpkg.EventSink
+	var tuiSession *tui.Session
+	if *tuiMode {
+		tuiSession = tui.NewSession()
+		runnerPolicy = policy.NewInteractive(cfg.Policy, tuiSession)
+		eventSink = tuiSession
+	}
+
 	ag := &agentpkg.Agent{
 		Config:     cfg,
 		Model:      llm,
 		Runtime:    rt,
 		Tools:      registry,
 		Parser:     action.NewParser(),
-		Policy:     policy.NewSimple(cfg.Policy),
+		Policy:     runnerPolicy,
 		Trajectory: store,
 		Workspace:  ws,
+		EventSink:  eventSink,
 	}
-	result, err := ag.Run(context.Background(), core.Task{Text: task, Repo: ws.Root()})
+	taskSpec := core.Task{Text: task, Repo: ws.Root()}
+	if *tuiMode {
+		result, err := tuiSession.Run(context.Background(), ag, taskSpec)
+		if result.Status != "" {
+			printTextResult(result)
+		}
+		return err
+	}
+
+	result, err := ag.Run(context.Background(), taskSpec)
 	if *jsonOutput {
 		data, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(data))
 	} else {
-		fmt.Printf("status: %s\n", result.Status)
-		fmt.Printf("steps: %d\n", result.Steps)
-		fmt.Printf("trajectory: %s\n", result.TrajectoryPath)
-		if result.Submission != "" {
-			fmt.Printf("submission: %s\n", result.Submission)
-		}
-		if result.Diff != "" {
-			fmt.Printf("\ndiff:\n%s\n", result.Diff)
-		}
+		printTextResult(result)
 	}
 	return err
+}
+
+func printTextResult(result agentpkg.Result) {
+	fmt.Printf("status: %s\n", result.Status)
+	fmt.Printf("steps: %d\n", result.Steps)
+	fmt.Printf("trajectory: %s\n", result.TrajectoryPath)
+	if result.Submission != "" {
+		fmt.Printf("submission: %s\n", result.Submission)
+	}
+	if result.Diff != "" {
+		fmt.Printf("\ndiff:\n%s\n", result.Diff)
+	}
 }
 
 func toolsCommand(args []string) error {
@@ -215,6 +243,7 @@ func resolveTask(taskText, taskFile string) (string, error) {
 func printUsage() {
 	fmt.Println(`Usage:
   sweagent run --task "fix the failing test" --repo . [--auto-approve]
+  sweagent run --task "fix the failing test" --repo . --tui
   sweagent tools
   sweagent config
 

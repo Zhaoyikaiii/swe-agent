@@ -20,6 +20,13 @@ func TestRunCommandMockSubmit(t *testing.T) {
 	}
 }
 
+func TestRunCommandRejectsTUIWithJSON(t *testing.T) {
+	err := run([]string{"run", "--task", "finish", "--tui", "--json"})
+	if err == nil {
+		t.Fatal("expected --tui and --json to be rejected")
+	}
+}
+
 func TestRunCommandCodexCLIProvider(t *testing.T) {
 	dir := t.TempDir()
 	repo := t.TempDir()

@@ -48,6 +48,11 @@ type Agent struct {
 	Policy     core.Policy
 	Trajectory core.TrajectoryStore
 	Workspace  Workspace
+	EventSink  EventSink
+}
+
+type EventSink interface {
+	EmitEvent(ctx context.Context, event core.Event) error
 }
 
 func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
@@ -67,14 +72,14 @@ func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
 			{Role: core.RoleUser, Content: a.initialUserMessage(task)},
 		},
 	}
-	_ = a.Trajectory.Append(ctx, core.Event{Type: "user_task", Time: time.Now(), Data: map[string]any{"task": task.Text, "repo": task.Repo}})
+	a.appendEvent(ctx, core.Event{Type: "user_task", Data: map[string]any{"task": task.Text, "repo": task.Repo}})
 
 	var runErr error
 	for a.shouldContinue(state) {
 		if err := a.Step(ctx, state); err != nil {
 			state.Status = "error"
 			runErr = err
-			_ = a.Trajectory.Append(ctx, core.Event{Type: "error", Time: time.Now(), Data: map[string]any{"error": err.Error()}})
+			a.appendEvent(ctx, core.Event{Type: "error", Data: map[string]any{"error": err.Error()}})
 			break
 		}
 		if state.Submitted {
@@ -100,7 +105,7 @@ func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
 		Usage:          state.Usage,
 		TrajectoryPath: a.Trajectory.Path(),
 	}
-	_ = a.Trajectory.Append(ctx, core.Event{Type: "final", Time: time.Now(), Data: map[string]any{"status": result.Status, "steps": result.Steps, "submission": result.Submission}})
+	a.appendEvent(ctx, core.Event{Type: "final", Data: map[string]any{"status": result.Status, "steps": result.Steps, "submission": result.Submission}})
 	return result, runErr
 }
 
@@ -113,7 +118,7 @@ func (a *Agent) Step(ctx context.Context, state *State) error {
 		MaxTokens:   a.Config.Model.MaxTokens,
 		WorkingDir:  state.Task.Repo,
 	}
-	_ = a.Trajectory.Append(ctx, core.Event{Type: "model_request", Time: time.Now(), Data: map[string]any{"step": state.Steps, "messages": len(req.Messages)}})
+	a.appendEvent(ctx, core.Event{Type: "model_request", Data: map[string]any{"step": state.Steps, "messages": len(req.Messages)}})
 
 	resp, err := a.Model.Complete(ctx, req)
 	if err != nil {
@@ -123,7 +128,7 @@ func (a *Agent) Step(ctx context.Context, state *State) error {
 	state.Usage.OutputTokens += resp.Usage.OutputTokens
 	state.Usage.CostUSD += resp.Usage.CostUSD
 	state.Messages = append(state.Messages, resp.Message)
-	_ = a.Trajectory.Append(ctx, core.Event{Type: "model_response", Time: time.Now(), Data: map[string]any{"step": state.Steps, "content": resp.Message.Content, "usage": resp.Usage}})
+	a.appendEvent(ctx, core.Event{Type: "model_response", Data: map[string]any{"step": state.Steps, "content": resp.Message.Content, "usage": resp.Usage}})
 
 	calls, err := a.Parser.Parse(resp)
 	if err != nil {
@@ -158,11 +163,11 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 	if !decision.Allowed {
 		msg := "tool denied: " + decision.Reason
 		state.Messages = append(state.Messages, core.Message{Role: core.RoleTool, Name: call.Name, Content: msg})
-		_ = a.Trajectory.Append(ctx, core.Event{Type: "tool_denied", Time: time.Now(), Data: map[string]any{"tool": call.Name, "reason": decision.Reason}})
+		a.appendEvent(ctx, core.Event{Type: "tool_denied", Data: map[string]any{"tool": call.Name, "reason": decision.Reason}})
 		return nil
 	}
 
-	_ = a.Trajectory.Append(ctx, core.Event{Type: "tool_call", Time: time.Now(), Data: map[string]any{"tool": call.Name, "args": call.Args}})
+	a.appendEvent(ctx, core.Event{Type: "tool_call", Data: map[string]any{"tool": call.Name, "args": call.Args}})
 	result, err := t.Execute(ctx, core.ToolInput{
 		Call:          call,
 		Runtime:       a.Runtime,
@@ -173,7 +178,7 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		return fmt.Errorf("execute tool %s: %w", call.Name, err)
 	}
 	result = a.Policy.FilterObservation(ctx, result)
-	_ = a.Trajectory.Append(ctx, core.Event{Type: "tool_result", Time: time.Now(), Data: map[string]any{"tool": call.Name, "code": result.Code, "timed_out": result.TimedOut, "output": result.Output}})
+	a.appendEvent(ctx, core.Event{Type: "tool_result", Data: map[string]any{"tool": call.Name, "code": result.Code, "timed_out": result.TimedOut, "output": result.Output}})
 
 	if call.Name == "submit" || isSubmitOutput(result.Output) {
 		state.Submitted = true
@@ -181,6 +186,16 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 	}
 	state.Messages = append(state.Messages, core.Message{Role: core.RoleTool, Name: call.Name, Content: formatToolObservation(result)})
 	return nil
+}
+
+func (a *Agent) appendEvent(ctx context.Context, event core.Event) {
+	if event.Time.IsZero() {
+		event.Time = time.Now()
+	}
+	_ = a.Trajectory.Append(ctx, event)
+	if a.EventSink != nil {
+		_ = a.EventSink.EmitEvent(ctx, event)
+	}
 }
 
 func (a *Agent) shouldContinue(state *State) bool {
