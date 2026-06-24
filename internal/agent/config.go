@@ -20,12 +20,19 @@ type AgentConfig struct {
 }
 
 type ModelConfig struct {
-	Provider    string  `yaml:"provider"`
-	Model       string  `yaml:"model"`
-	BaseURL     string  `yaml:"base_url"`
-	APIKeyEnv   string  `yaml:"api_key_env"`
-	Temperature float64 `yaml:"temperature"`
-	MaxTokens   int     `yaml:"max_tokens"`
+	Provider       string   `yaml:"provider"`
+	Model          string   `yaml:"model"`
+	BaseURL        string   `yaml:"base_url"`
+	APIKeyEnv      string   `yaml:"api_key_env"`
+	Temperature    float64  `yaml:"temperature"`
+	MaxTokens      int      `yaml:"max_tokens"`
+	Command        string   `yaml:"command"`
+	Profile        string   `yaml:"profile"`
+	OSS            bool     `yaml:"oss"`
+	LocalProvider  string   `yaml:"local_provider"`
+	Sandbox        string   `yaml:"sandbox"`
+	ApprovalPolicy string   `yaml:"approval_policy"`
+	ExtraArgs      []string `yaml:"extra_args"`
 }
 
 type RuntimeConfig struct {
@@ -58,11 +65,14 @@ func DefaultConfig() Config {
 			SystemPrompt:    defaultSystemPrompt,
 		},
 		Model: ModelConfig{
-			Provider:    "mock",
-			Model:       "mock",
-			APIKeyEnv:   "OPENAI_API_KEY",
-			Temperature: 0.1,
-			MaxTokens:   2048,
+			Provider:       "mock",
+			Model:          "mock",
+			APIKeyEnv:      "OPENAI_API_KEY",
+			Temperature:    0.1,
+			MaxTokens:      2048,
+			Command:        "codex",
+			Sandbox:        "read-only",
+			ApprovalPolicy: "never",
 		},
 		Runtime: RuntimeConfig{
 			Type:           "local",

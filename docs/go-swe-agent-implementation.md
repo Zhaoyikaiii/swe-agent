@@ -159,6 +159,14 @@ type ModelResponse struct {
 - provider 特有字段放到 `ModelOptions map[string]any`，不要污染主接口。
 - retry、rate limit、cost 统计包在 model adapter 外层。
 
+当前 Go MVP 已落地的 provider：
+
+- `mock`：本地链路测试，不调用外部模型。
+- `openai-compatible`：调用兼容 OpenAI Chat Completions 的 `/chat/completions` 接口。
+- `codex-cli`：调用本机 `codex exec`，并强约束 Codex 只输出下一步 `swe_shell` action；实际命令执行仍由外层 Go agent 的 runtime、policy 和 tool 层负责。
+
+`codex-cli` 默认使用 `--ephemeral --sandbox read-only --ask-for-approval never`，目的是降低“agent 套 agent”导致的副作用。它适合作为本地决策模型接入，而不是替代外层执行器。
+
 ### Runtime
 
 ```go
@@ -641,4 +649,3 @@ sweagent run \
 - `status=submitted` 或明确失败原因
 
 这比一开始实现完整平台更重要。只要 Go 内核的接口干净，后续接 Web UI、MCP、子 agent、GitHub issue runner、agent-git-service 都是增量工作。
-

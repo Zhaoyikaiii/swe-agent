@@ -111,6 +111,7 @@ func (a *Agent) Step(ctx context.Context, state *State) error {
 		Tools:       a.Tools.List(),
 		Temperature: a.Config.Model.Temperature,
 		MaxTokens:   a.Config.Model.MaxTokens,
+		WorkingDir:  state.Task.Repo,
 	}
 	_ = a.Trajectory.Append(ctx, core.Event{Type: "model_request", Time: time.Now(), Data: map[string]any{"step": state.Steps, "messages": len(req.Messages)}})
 

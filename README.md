@@ -21,12 +21,43 @@ OPENAI_API_KEY=... go run ./cmd/sweagent run \
   --auto-approve
 ```
 
+也可以把本地 Codex CLI 用作 provider。这个模式下 Codex 只负责输出下一步 `swe_shell` action，实际命令执行仍由本项目的 runtime、policy 和 tool 层控制：
+
+```bash
+go run ./cmd/sweagent run \
+  --model-provider codex-cli \
+  --model gpt-5 \
+  --task "fix the failing test" \
+  --repo . \
+  --auto-approve
+```
+
+对应配置示例：
+
+```yaml
+model:
+  provider: codex-cli
+  model: gpt-5
+  command: codex
+  sandbox: read-only
+  approval_policy: never
+```
+
+如果使用本地开源 provider，可以在配置里加：
+
+```yaml
+model:
+  provider: codex-cli
+  oss: true
+  local_provider: ollama
+```
+
 ## 模块
 
 - `cmd/sweagent`: CLI 入口，提供 `run`、`tools`、`config`。
 - `internal/agent`: agent 主循环和状态机。
 - `internal/action`: 模型输出到工具调用的解析器。
-- `internal/model`: mock 与 OpenAI-compatible 模型适配。
+- `internal/model`: mock、OpenAI-compatible 与 Codex CLI 模型适配。
 - `internal/runtime`: 本地命令执行 runtime。
 - `internal/tool`: 文件、搜索、diff、patch、测试、提交等工具。
 - `internal/policy`: 工具审批、危险命令拦截、观测结果过滤。

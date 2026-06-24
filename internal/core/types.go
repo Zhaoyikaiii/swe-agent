@@ -37,6 +37,7 @@ type ModelRequest struct {
 	Tools       []ToolSpec `json:"tools,omitempty"`
 	Temperature float64    `json:"temperature"`
 	MaxTokens   int        `json:"max_tokens"`
+	WorkingDir  string     `json:"working_dir,omitempty"`
 }
 
 type ModelResponse struct {
