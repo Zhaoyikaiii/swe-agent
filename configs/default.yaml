@@ -1,0 +1,35 @@
+agent:
+  max_steps: 40
+  max_cost_usd: 3.0
+  wall_time_seconds: 3600
+  action_mode: shell
+model:
+  provider: mock
+  model: mock
+  api_key_env: OPENAI_API_KEY
+  temperature: 0.1
+  max_tokens: 2048
+runtime:
+  type: local
+  timeout_seconds: 60
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+tools:
+  enabled:
+    - read_file
+    - grep
+    - list_files
+    - git_diff
+    - apply_patch
+    - shell
+    - run_tests
+    - submit
+policy:
+  auto_approve_read: true
+  auto_approve_write: false
+  auto_approve_exec: false
+trajectory:
+  dir: trajectories
