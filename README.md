@@ -6,9 +6,12 @@
 
 ```bash
 go test ./...
+go run ./cmd/sweagent
 go run ./cmd/sweagent tools
 go run ./cmd/sweagent run --task "finish immediately" --repo . --json
 ```
+
+默认无参数会进入交互式 TUI。在底部输入 task 后回车即可发起一次运行；运行完成后可以继续输入下一条 task。常用 slash command 包括 `/clear` 清空当前 TUI 会话视图、`/quit` 退出、`/trace` 查看轨迹路径。
 
 默认使用 `mock` 模型，适合本地验证框架链路。接入 OpenAI-compatible 模型时，修改 `configs/default.yaml` 或通过命令行覆盖：
 
@@ -54,7 +57,7 @@ model:
 
 ## 模块
 
-- `cmd/sweagent`: CLI 入口，提供 `run`、`tools`、`config`。
+- `cmd/sweagent`: CLI 入口，提供默认 TUI、`tui`、`run`、`tools`、`config`。
 - `internal/agent`: agent 主循环和状态机。
 - `internal/action`: 模型输出到工具调用的解析器。
 - `internal/model`: mock、OpenAI-compatible 与 Codex CLI 模型适配。

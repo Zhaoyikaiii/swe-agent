@@ -66,18 +66,36 @@ func (s *Session) RequestApproval(ctx context.Context, req policy.ApprovalReques
 }
 
 func (s *Session) Run(ctx context.Context, ag *agentpkg.Agent, task core.Task) (agentpkg.Result, error) {
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	m := newModel(s, ag, task, runCtx, cancel)
+	m := newRunModel(s, ag, task, ctx)
 	program := tea.NewProgram(m, tea.WithAltScreen())
 	finalModel, err := program.Run()
-	cancel()
+	if m.cancel != nil {
+		m.cancel()
+	}
 	if err != nil {
 		return agentpkg.Result{}, err
 	}
 	if final, ok := finalModel.(*model); ok {
 		if !final.done && final.canceled {
+			return final.result, context.Canceled
+		}
+		return final.result, final.runErr
+	}
+	return agentpkg.Result{}, nil
+}
+
+func (s *Session) Loop(ctx context.Context, ag *agentpkg.Agent, repo string) (agentpkg.Result, error) {
+	m := newLoopModel(s, ag, repo, ctx)
+	program := tea.NewProgram(m, tea.WithAltScreen())
+	finalModel, err := program.Run()
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if err != nil {
+		return agentpkg.Result{}, err
+	}
+	if final, ok := finalModel.(*model); ok {
+		if final.canceled {
 			return final.result, context.Canceled
 		}
 		return final.result, final.runErr
@@ -109,6 +127,7 @@ const (
 	modeNormal uiMode = iota
 	modeApproval
 	modeCommand
+	modeTask
 	modeSearch
 	modeHelp
 	modeQuitConfirm
@@ -131,8 +150,11 @@ type model struct {
 	session *Session
 	agent   *agentpkg.Agent
 	task    core.Task
+	parent  context.Context
 	runCtx  context.Context
 	cancel  context.CancelFunc
+	loop    bool
+	start   bool
 
 	width  int
 	height int
@@ -153,6 +175,7 @@ type model struct {
 	approval *approvalState
 	result   agentpkg.Result
 	runErr   error
+	running  bool
 	done     bool
 	canceled bool
 
@@ -162,7 +185,26 @@ type model struct {
 	startedAt  time.Time
 }
 
-func newModel(session *Session, ag *agentpkg.Agent, task core.Task, runCtx context.Context, cancel context.CancelFunc) *model {
+func newRunModel(session *Session, ag *agentpkg.Agent, task core.Task, parent context.Context) *model {
+	m := newModel(session, ag, task, parent)
+	m.start = true
+	m.status = "starting"
+	return m
+}
+
+func newLoopModel(session *Session, ag *agentpkg.Agent, repo string, parent context.Context) *model {
+	m := newModel(session, ag, core.Task{Repo: repo}, parent)
+	m.loop = true
+	m.mode = modeTask
+	m.status = "ready"
+	m.prepareTaskInput(true)
+	return m
+}
+
+func newModel(session *Session, ag *agentpkg.Agent, task core.Task, parent context.Context) *model {
+	if parent == nil {
+		parent = context.Background()
+	}
 	command := textinput.New()
 	command.Prompt = ":"
 	command.CharLimit = 4096
@@ -180,8 +222,7 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, runCtx conte
 		session:   session,
 		agent:     ag,
 		task:      task,
-		runCtx:    runCtx,
-		cancel:    cancel,
+		parent:    parent,
 		mode:      modeNormal,
 		view:      viewEvent,
 		focus:     "timeline",
@@ -196,12 +237,18 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, runCtx conte
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.spinner.Tick,
 		waitForEvent(m.session.events),
 		waitForApproval(m.session.approvals),
-		runAgent(m.runCtx, m.agent, m.task),
-	)
+	}
+	if m.mode == modeTask {
+		cmds = append(cmds, m.command.Focus())
+	}
+	if m.start {
+		cmds = append(cmds, m.startRun(m.task))
+	}
+	return tea.Batch(cmds...)
 }
 
 func waitForEvent(ch <-chan eventMsg) tea.Cmd {
@@ -234,7 +281,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		if !m.done {
+		if m.running {
 			cmds = append(cmds, cmd)
 		}
 	case eventMsg:
@@ -248,7 +295,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateDetail()
 		cmds = append(cmds, waitForApproval(m.session.approvals))
 	case runDoneMsg:
+		m.running = false
 		m.done = true
+		m.cancel = nil
 		m.result = msg.result
 		m.runErr = msg.err
 		if msg.err != nil {
@@ -257,6 +306,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "finished: " + msg.result.Status
 		}
 		m.updateDetail()
+		if m.loop && m.approval == nil {
+			m.prepareTaskInput(true)
+			cmds = append(cmds, m.command.Focus())
+		}
 	case editorDoneMsg:
 		if msg.err != nil {
 			m.status = "editor error: " + msg.err.Error()
@@ -277,6 +330,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	switch m.mode {
 	case modeCommand:
 		return m.handleCommandKey(msg)
+	case modeTask:
+		return m.handleTaskKey(msg)
 	case modeSearch:
 		return m.handleSearchKey(msg)
 	case modeHelp:
@@ -308,6 +363,10 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		m.openHelp()
 	case ":":
 		return m.openCommandMode(":")
+	case "i":
+		if m.loop && !m.running {
+			return m.openTaskMode()
+		}
 	case "/":
 		return m.openSearchMode()
 	case "tab", "shift+tab":
@@ -407,6 +466,33 @@ func (m *model) handleCommandKey(msg tea.KeyMsg) tea.Cmd {
 	}
 }
 
+func (m *model) handleTaskKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "ctrl+c":
+		return m.confirmQuit()
+	case "esc":
+		m.command.Blur()
+		m.mode = modeNormal
+		m.status = "task input closed; press i to start a task"
+		return nil
+	case "enter":
+		input := strings.TrimSpace(m.command.Value())
+		m.command.Reset()
+		if input == "" {
+			m.status = "enter a task or slash command"
+			return nil
+		}
+		if strings.HasPrefix(input, "/") {
+			return m.executeSlashCommand(input)
+		}
+		return m.startRun(core.Task{Text: input, Repo: m.task.Repo})
+	default:
+		var cmd tea.Cmd
+		m.command, cmd = m.command.Update(msg)
+		return cmd
+	}
+}
+
 func (m *model) handleSearchKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc", "ctrl+c":
@@ -445,7 +531,9 @@ func (m *model) handleQuitConfirmKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "y", "q", "enter":
 		m.canceled = true
-		m.cancel()
+		if m.cancel != nil {
+			m.cancel()
+		}
 		return tea.Quit
 	case "n", "esc":
 		m.mode = modeNormal
@@ -455,7 +543,7 @@ func (m *model) handleQuitConfirmKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *model) confirmQuit() tea.Cmd {
-	if m.done {
+	if !m.running {
 		return tea.Quit
 	}
 	m.mode = modeQuitConfirm
@@ -488,6 +576,8 @@ func (m *model) closeInput() {
 	m.command.Blur()
 	if m.approval != nil {
 		m.mode = modeApproval
+	} else if m.loop && !m.running && !m.done {
+		m.prepareTaskInput(false)
 	} else {
 		m.mode = modeNormal
 	}
@@ -501,9 +591,45 @@ func (m *model) executeCommand(command string) tea.Cmd {
 		return m.confirmQuit()
 	case "q!", "quit!", "qa", "qa!":
 		m.canceled = true
-		m.cancel()
+		if m.cancel != nil {
+			m.cancel()
+		}
 		return tea.Quit
 	case "h", "help":
+		m.openHelp()
+	case "d", "diff":
+		m.view = viewDiff
+		m.focus = "detail"
+		m.updateDetail()
+	case "t", "timeline", "events":
+		m.view = viewEvent
+		m.focus = "timeline"
+		m.updateDetail()
+	case "clear":
+		m.clearSession()
+	case "trace":
+		m.view = viewTrace
+		m.focus = "detail"
+		m.status = "trajectory: " + m.trajectoryPath()
+		m.updateDetail()
+	case "open-trace":
+		return m.openTrace()
+	default:
+		m.status = "unknown command: " + command
+	}
+	return nil
+}
+
+func (m *model) executeSlashCommand(command string) tea.Cmd {
+	command = strings.TrimSpace(strings.TrimPrefix(command, "/"))
+	switch command {
+	case "":
+		m.status = "empty slash command"
+	case "clear":
+		m.clearSession()
+	case "q", "quit", "exit":
+		return m.confirmQuit()
+	case "h", "help", "?":
 		m.openHelp()
 	case "d", "diff":
 		m.view = viewDiff
@@ -521,9 +647,88 @@ func (m *model) executeCommand(command string) tea.Cmd {
 	case "open-trace":
 		return m.openTrace()
 	default:
-		m.status = "unknown command: " + command
+		m.status = "unknown slash command: /" + command
+	}
+	if m.loop && !m.running && m.mode != modeHelp {
+		m.prepareTaskInput(true)
+		return m.command.Focus()
 	}
 	return nil
+}
+
+func (m *model) openTaskMode() tea.Cmd {
+	m.prepareTaskInput(false)
+	return m.command.Focus()
+}
+
+func (m *model) prepareTaskInput(reset bool) {
+	m.mode = modeTask
+	m.command.Prompt = "task> "
+	m.command.Placeholder = "type a task or /clear"
+	m.command.Width = max(10, m.width-4)
+	if reset {
+		m.command.Reset()
+	}
+}
+
+func (m *model) startRun(task core.Task) tea.Cmd {
+	task.Text = strings.TrimSpace(task.Text)
+	if task.Text == "" {
+		m.status = "task is empty"
+		return nil
+	}
+	if m.running {
+		m.status = "run is already active"
+		return nil
+	}
+	if task.Repo == "" {
+		task.Repo = m.task.Repo
+	}
+	if task.Repo == "" && m.agent != nil && m.agent.Workspace != nil {
+		task.Repo = m.agent.Workspace.Root()
+	}
+	m.task = task
+	m.runCtx, m.cancel = context.WithCancel(m.parent)
+	m.running = true
+	m.done = false
+	m.canceled = false
+	m.result = agentpkg.Result{}
+	m.runErr = nil
+	m.startedAt = time.Now()
+	m.mode = modeNormal
+	m.command.Blur()
+	m.view = viewEvent
+	m.focus = "timeline"
+	m.status = "running task: " + shortString(task.Text, 48)
+	m.updateDetail()
+	return runAgent(m.runCtx, m.agent, m.task)
+}
+
+func (m *model) clearSession() {
+	m.events = nil
+	m.selected = -1
+	m.timelineOffset = 0
+	m.result = agentpkg.Result{}
+	m.runErr = nil
+	m.done = false
+	m.query = ""
+	m.pendingKey = ""
+	m.view = viewEvent
+	m.focus = "timeline"
+	m.detail.GotoTop()
+	m.drainEvents()
+	m.status = "cleared"
+	m.updateDetail()
+}
+
+func (m *model) drainEvents() {
+	for {
+		select {
+		case <-m.session.events:
+		default:
+			return
+		}
+	}
 }
 
 func (m *model) openTrace() tea.Cmd {
@@ -656,7 +861,7 @@ func (m *model) bodyHeight() int {
 	if m.approval != nil {
 		reserved += lipgloss.Height(m.approvalView(max(1, m.width-2)))
 	}
-	if m.mode == modeCommand || m.mode == modeSearch {
+	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
 		reserved += 1
 	}
 	return max(1, m.height-reserved)
@@ -707,6 +912,9 @@ func (m *model) detailContent() string {
 		if m.selected >= 0 && m.selected < len(m.events) {
 			return eventDetail(m.events[m.selected])
 		}
+		if m.loop && !m.running {
+			return "Type a task below to start.\n\nSlash commands: /clear, /quit, /help, /trace, /open-trace."
+		}
 		return "Waiting for events..."
 	}
 }
@@ -735,7 +943,7 @@ func (m *model) View() string {
 	if m.approval != nil {
 		parts = append(parts, m.approvalView(m.width-2))
 	}
-	if m.mode == modeCommand || m.mode == modeSearch {
+	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
 		parts = append(parts, inputStyle.Width(m.width-2).Render(m.command.View()))
 	}
 	parts = append(parts, m.footerView())
@@ -743,16 +951,22 @@ func (m *model) View() string {
 }
 
 func (m *model) headerView() string {
-	state := "running"
-	if m.done {
+	state := "idle"
+	if m.running {
+		state = "running"
+	} else if m.done {
 		state = "done"
 	}
 	if m.mode == modeApproval {
 		state = "approval"
 	}
 	elapsed := time.Since(m.startedAt).Round(time.Second)
+	modelName := ""
+	if m.agent != nil {
+		modelName = m.agent.Config.Model.Model
+	}
 	title := fmt.Sprintf(" swe-agent  %s %s  step %d  %s  %s ",
-		m.spinner.View(), state, len(m.events), m.agent.Config.Model.Model, elapsed)
+		m.spinner.View(), state, len(m.events), modelName, elapsed)
 	if m.done {
 		title = fmt.Sprintf(" swe-agent  %s  steps %d  %s ", m.result.Status, m.result.Steps, elapsed)
 	}
@@ -779,6 +993,9 @@ func (m *model) bodyView() string {
 
 func (m *model) timelineView(width, height int) string {
 	if len(m.events) == 0 {
+		if m.loop && !m.running {
+			return mutedStyle.Render("No events yet. Enter a task below.")
+		}
 		return mutedStyle.Render("Waiting for agent events...")
 	}
 	lines := make([]string, 0, height)
@@ -843,10 +1060,12 @@ func (m *model) shortHelp() []key.Binding {
 	switch m.mode {
 	case modeApproval:
 		return []key.Binding{keyAllow, keyDeny, keyRemember, keyHelp}
+	case modeTask:
+		return []key.Binding{keyEnter, keySlashClear, keyEsc}
 	case modeCommand, modeSearch:
 		return []key.Binding{keyEnter, keyEsc}
 	default:
-		return []key.Binding{keyMove, keyOpen, keyCommand, keySearch, keyHelp, keyQuit}
+		return []key.Binding{keyMove, keyOpen, keyTaskInput, keyCommand, keySearch, keyHelp, keyQuit}
 	}
 }
 
@@ -856,6 +1075,7 @@ func (m *model) fullHelp() [][]key.Binding {
 		{keyScrollHalf, keyScrollPage, keyTab, keyOpen},
 		{keySearch, keyNext, keyPrev, keyCommand, keyHelp},
 		{keyDiff, keyTimeline, keyTrace, keyOpenTrace},
+		{keyTaskInput, keySlashClear, keySlashQuit},
 		{keyAllow, keyDeny, keyRemember, keyExpandApproval},
 		{keyQuit, keyCancel},
 	}
@@ -1039,12 +1259,15 @@ var (
 	keySearch         = key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search"))
 	keyNext           = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next match"))
 	keyPrev           = key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match"))
+	keyTaskInput      = key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "task input"))
 	keyCommand        = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
 	keyHelp           = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
 	keyDiff           = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
 	keyTimeline       = key.NewBinding(key.WithKeys("t", ":timeline"), key.WithHelp("t", "timeline"))
 	keyTrace          = key.NewBinding(key.WithKeys(":trace"), key.WithHelp(":trace", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
+	keySlashClear     = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
+	keySlashQuit      = key.NewBinding(key.WithKeys("/quit"), key.WithHelp("/quit", "quit"))
 	keyAllow          = key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "allow"))
 	keyDeny           = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "deny"))
 	keyRemember       = key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "allow risk"))

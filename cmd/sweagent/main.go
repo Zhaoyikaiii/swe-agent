@@ -32,12 +32,13 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		printUsage()
-		return nil
+		return tuiCommand(nil)
 	}
 	switch args[0] {
 	case "run":
 		return runCommand(args[1:])
+	case "tui":
+		return tuiCommand(args[1:])
 	case "tools":
 		return toolsCommand(args[1:])
 	case "config":
@@ -50,19 +51,41 @@ func run(args []string) error {
 	}
 }
 
+type agentOptions struct {
+	configPath    string
+	repo          string
+	modelProvider string
+	modelName     string
+	trajectoryDir string
+	mockResponses string
+	autoApprove   bool
+}
+
+func defaultAgentOptions() agentOptions {
+	return agentOptions{
+		configPath: "configs/default.yaml",
+		repo:       ".",
+	}
+}
+
+func bindAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
+	fs.StringVar(&opts.configPath, "config", opts.configPath, "path to YAML config")
+	fs.StringVar(&opts.repo, "repo", opts.repo, "repository/workspace path")
+	fs.StringVar(&opts.modelProvider, "model-provider", "", "override model provider")
+	fs.StringVar(&opts.modelName, "model", "", "override model name")
+	fs.StringVar(&opts.trajectoryDir, "trajectory-dir", "", "override trajectory output directory")
+	fs.BoolVar(&opts.autoApprove, "auto-approve", false, "auto approve read/write/exec tools")
+	fs.StringVar(&opts.mockResponses, "mock-response", "", "mock model response; repeat actions with ||| separator")
+}
+
 func runCommand(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	configPath := fs.String("config", "configs/default.yaml", "path to YAML config")
+	opts := defaultAgentOptions()
+	bindAgentFlags(fs, &opts)
 	taskText := fs.String("task", "", "task text")
 	taskFile := fs.String("task-file", "", "path to task text file")
-	repo := fs.String("repo", ".", "repository/workspace path")
-	modelProvider := fs.String("model-provider", "", "override model provider")
-	modelName := fs.String("model", "", "override model name")
-	trajectoryDir := fs.String("trajectory-dir", "", "override trajectory output directory")
-	autoApprove := fs.Bool("auto-approve", false, "auto approve read/write/exec tools")
 	jsonOutput := fs.Bool("json", false, "print result as JSON")
 	tuiMode := fs.Bool("tui", false, "run with an interactive terminal UI")
-	mockResponses := fs.String("mock-response", "", "mock model response; repeat actions with ||| separator")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -73,63 +96,12 @@ func runCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	if *modelProvider != "" {
-		cfg.Model.Provider = *modelProvider
-	}
-	if *modelName != "" {
-		cfg.Model.Model = *modelName
-	}
-	if *trajectoryDir != "" {
-		cfg.Trajectory.Dir = *trajectoryDir
-	}
-	if *autoApprove {
-		cfg.Policy.AutoApproveRead = true
-		cfg.Policy.AutoApproveWrite = true
-		cfg.Policy.AutoApproveExec = true
-	}
-
-	ws, err := workspace.New(*repo)
-	if err != nil {
-		return err
-	}
-	rt := localruntime.NewLocal(cfg.Runtime.Env)
-	registry := tool.NewRegistry(cfg.Tools.Enabled)
-	store, err := trajectory.NewJSONLStore(cfg.Trajectory.Dir)
+	ag, tuiSession, store, err := buildAgent(opts, *tuiMode)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	llm, err := buildModel(cfg, *mockResponses)
-	if err != nil {
-		return err
-	}
-
-	var runnerPolicy core.Policy = policy.NewSimple(cfg.Policy)
-	var eventSink agentpkg.EventSink
-	var tuiSession *tui.Session
-	if *tuiMode {
-		tuiSession = tui.NewSession()
-		runnerPolicy = policy.NewInteractive(cfg.Policy, tuiSession)
-		eventSink = tuiSession
-	}
-
-	ag := &agentpkg.Agent{
-		Config:     cfg,
-		Model:      llm,
-		Runtime:    rt,
-		Tools:      registry,
-		Parser:     action.NewParser(),
-		Policy:     runnerPolicy,
-		Trajectory: store,
-		Workspace:  ws,
-		EventSink:  eventSink,
-	}
-	taskSpec := core.Task{Text: task, Repo: ws.Root()}
+	taskSpec := core.Task{Text: task, Repo: ag.Workspace.Root()}
 	if *tuiMode {
 		result, err := tuiSession.Run(context.Background(), ag, taskSpec)
 		if result.Status != "" {
@@ -146,6 +118,84 @@ func runCommand(args []string) error {
 		printTextResult(result)
 	}
 	return err
+}
+
+func tuiCommand(args []string) error {
+	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
+	opts := defaultAgentOptions()
+	bindAgentFlags(fs, &opts)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ag, tuiSession, store, err := buildAgent(opts, true)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	_, err = tuiSession.Loop(context.Background(), ag, ag.Workspace.Root())
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func buildAgent(opts agentOptions, interactive bool) (*agentpkg.Agent, *tui.Session, *trajectory.JSONLStore, error) {
+	cfg, err := config.Load(opts.configPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if opts.modelProvider != "" {
+		cfg.Model.Provider = opts.modelProvider
+	}
+	if opts.modelName != "" {
+		cfg.Model.Model = opts.modelName
+	}
+	if opts.trajectoryDir != "" {
+		cfg.Trajectory.Dir = opts.trajectoryDir
+	}
+	if opts.autoApprove {
+		cfg.Policy.AutoApproveRead = true
+		cfg.Policy.AutoApproveWrite = true
+		cfg.Policy.AutoApproveExec = true
+	}
+
+	ws, err := workspace.New(opts.repo)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	rt := localruntime.NewLocal(cfg.Runtime.Env)
+	registry := tool.NewRegistry(cfg.Tools.Enabled)
+	store, err := trajectory.NewJSONLStore(cfg.Trajectory.Dir)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	llm, err := buildModel(cfg, opts.mockResponses)
+	if err != nil {
+		store.Close()
+		return nil, nil, nil, err
+	}
+
+	var runnerPolicy core.Policy = policy.NewSimple(cfg.Policy)
+	var eventSink agentpkg.EventSink
+	var tuiSession *tui.Session
+	if interactive {
+		tuiSession = tui.NewSession()
+		runnerPolicy = policy.NewInteractive(cfg.Policy, tuiSession)
+		eventSink = tuiSession
+	}
+
+	ag := &agentpkg.Agent{
+		Config:     cfg,
+		Model:      llm,
+		Runtime:    rt,
+		Tools:      registry,
+		Parser:     action.NewParser(),
+		Policy:     runnerPolicy,
+		Trajectory: store,
+		Workspace:  ws,
+		EventSink:  eventSink,
+	}
+	return ag, tuiSession, store, nil
 }
 
 func printTextResult(result agentpkg.Result) {
@@ -242,12 +292,15 @@ func resolveTask(taskText, taskFile string) (string, error) {
 
 func printUsage() {
 	fmt.Println(`Usage:
+  sweagent
+  sweagent tui [--repo .]
   sweagent run --task "fix the failing test" --repo . [--auto-approve]
   sweagent run --task "fix the failing test" --repo . --tui
   sweagent tools
   sweagent config
 
 Commands:
+  tui      open the interactive terminal UI
   run      execute one SWE-agent task
   tools    list enabled tools
   config   print merged configuration`)
