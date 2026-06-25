@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/local/swe-agent/internal/core"
 	mockmodel "github.com/local/swe-agent/internal/model"
 	"github.com/local/swe-agent/internal/policy"
+	"github.com/local/swe-agent/internal/problemtrace"
 )
 
 func TestLoopSlashClearResetsVisibleSession(t *testing.T) {
@@ -266,6 +268,75 @@ func TestErrorDetailRendersMultilineErrorText(t *testing.T) {
 	}
 }
 
+func TestTraceWorkspaceRendersPromptAndCards(t *testing.T) {
+	manager := problemtrace.NewManager()
+	task := core.Task{Text: "fix tests", Repo: "/repo"}
+	var events []core.Event
+	events = append(events, core.Event{Type: "user_task", Data: map[string]any{"task": task.Text, "repo": task.Repo}})
+	events = append(events, manager.StartRun(context.Background(), task, problemtrace.TraceResource{RepoPath: "/repo", ModelProvider: "mock", Model: "mock"})...)
+	prompt := manager.BuildPrompt(context.Background(), problemtrace.PromptInput{
+		Step:       1,
+		Model:      "mock",
+		Provider:   "mock",
+		WorkingDir: "/repo",
+		Messages: []core.Message{
+			{Role: core.RoleSystem, Content: "system"},
+			{Role: core.RoleUser, Content: "fix tests"},
+		},
+		Tools: []core.ToolSpec{{Name: "run_tests", Description: "run tests"}},
+	})
+	events = append(events, prompt.Events...)
+	events = append(events, manager.FinishRun(context.Background(), "submitted", "done")...)
+
+	record := taskRecord{Task: task, Events: events, Result: agentpkg.Result{TrajectoryPath: "trace.jsonl"}}
+	promptView := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabPrompt}, 80, "trace.jsonl")
+	if !strings.Contains(promptView, "prompt-1 step=1") || !strings.Contains(promptView, "Investigation Frontier") {
+		t.Fatalf("expected prompt workspace content, got:\n%s", promptView)
+	}
+	cardsView := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabCards}, 80, "trace.jsonl")
+	if !strings.Contains(cardsView, "run_summary") || !strings.Contains(cardsView, "draft") {
+		t.Fatalf("expected draft cards workspace content, got:\n%s", cardsView)
+	}
+}
+
+func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
+	record := taskRecord{
+		Task:   core.Task{Text: "fix go test import cycle", Repo: "/repo"},
+		Events: mockImportCycleProblemTraceEvents(),
+		Result: agentpkg.Result{TrajectoryPath: "trajectories/run-import-cycle.jsonl"},
+	}
+
+	rendered := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabTrace}, 120, record.Result.TrajectoryPath)
+	t.Logf("rendered trace tree:\n%s", rendered)
+
+	for _, want := range []string{
+		"Problem Trace Workspace",
+		"[1 Trace]  2 Frontier  3 Memory  4 Events  5 Prompt  6 Cards",
+		"Trace ID: trace-import-cycle",
+		"Trajectory: trajectories/run-import-cycle.jsonl",
+		"Repository: /repo",
+		"Task: fix go test import cycle",
+		"Current Symptom: Go compile failed with import cycle not allowed: go test ./...",
+		"Trace History",
+		"* Problem (Go compile failed with import cycle not allowed: go test ./...)",
+		"! Go compile failed with import cycle not allowed: go test ./... (observed)",
+		"> Resolve the Go import cycle (active)",
+		"+ package service imports handler and handler imports service (supports)",
+		"P Prompt snapshot 1 (captured)",
+		"Span Graph",
+		"span-1 problem.run parent=root status=ok",
+		"span-2 prompt.build parent=span-1 status=ok",
+		"span-3 model.call parent=span-1 status=ok",
+		"span-4 test.run parent=span-3 status=error",
+		"Links",
+		"span-4 --supports--> dir-go-import-cycle",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected rendered trace tree to contain %q, got:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestErrorFinalSelectsSummaryWithErrorText(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	model.detail.Width = 80
@@ -278,6 +349,142 @@ func TestErrorFinalSelectsSummaryWithErrorText(t *testing.T) {
 	}
 	if !strings.Contains(model.detailContent(), "codex failed with stderr") {
 		t.Fatalf("expected final review to include error text, got:\n%s", model.detailContent())
+	}
+}
+
+func mockImportCycleProblemTraceEvents() []core.Event {
+	traceID := "trace-import-cycle"
+	task := "fix go test import cycle"
+	repo := "/repo"
+	runSpan := problemtrace.TraceSpan{
+		TraceID: traceID,
+		SpanID:  "span-1",
+		Name:    problemtrace.SpanProblemRun,
+		Kind:    "run",
+		Status:  problemtrace.SpanStatusOK,
+		Attributes: map[string]any{
+			problemtrace.AttrRepoPath:      repo,
+			problemtrace.AttrModelProvider: "mock",
+			problemtrace.AttrModelName:     "mock",
+		},
+	}
+	promptSpan := problemtrace.TraceSpan{
+		TraceID:      traceID,
+		SpanID:       "span-2",
+		ParentSpanID: "span-1",
+		Name:         problemtrace.SpanPromptBuild,
+		Kind:         "prompt",
+		Status:       problemtrace.SpanStatusOK,
+	}
+	modelSpan := problemtrace.TraceSpan{
+		TraceID:      traceID,
+		SpanID:       "span-3",
+		ParentSpanID: "span-1",
+		Name:         problemtrace.SpanModelCall,
+		Kind:         "model",
+		Status:       problemtrace.SpanStatusOK,
+	}
+	testSpan := problemtrace.TraceSpan{
+		TraceID:      traceID,
+		SpanID:       "span-4",
+		ParentSpanID: "span-3",
+		Name:         problemtrace.SpanTestRun,
+		Kind:         "tool",
+		Status:       problemtrace.SpanStatusError,
+		Attributes: map[string]any{
+			problemtrace.AttrToolName:           "run_tests",
+			problemtrace.AttrTestCommand:        "go test ./...",
+			problemtrace.AttrToolExitCode:       1,
+			problemtrace.AttrTestErrorSignature: "go_import_cycle",
+		},
+		Links: []problemtrace.TraceLink{{
+			TraceID: traceID,
+			FromID:  "span-4",
+			ToID:    "dir-go-import-cycle",
+			Kind:    problemtrace.LinkSupports,
+			Attributes: map[string]any{
+				problemtrace.AttrDirectionID:    "dir-go-import-cycle",
+				problemtrace.AttrErrorSignature: "go_import_cycle",
+			},
+		}},
+	}
+	prompt := problemtrace.PromptSnapshot{
+		ID:           "prompt-1",
+		Step:         1,
+		Model:        "mock",
+		MessageCount: 3,
+		ToolCount:    1,
+		Blocks: []problemtrace.PromptBlock{
+			{Kind: "problem_context", Title: "Problem Context", Included: true, Content: task},
+			{Kind: "frontier", Title: "Investigation Frontier", Included: true, Summary: "verify current import cycle before patching"},
+		},
+	}
+	symptom := problemtrace.Symptom{
+		ID:         "symptom-1",
+		Kind:       "compile_error",
+		Summary:    "Go compile failed with import cycle not allowed: go test ./...",
+		ErrorType:  "go_import_cycle",
+		Command:    "go test ./...",
+		RawExcerpt: "package repo/service imports repo/handler imports repo/service: import cycle not allowed",
+		Packages:   []string{"repo/service", "repo/handler"},
+	}
+	direction := problemtrace.InvestigationDirection{
+		ID:         "dir-go-import-cycle",
+		Hypothesis: "Resolve the Go import cycle",
+		Rationale:  "The test output reports import cycle not allowed, so the next useful evidence is the exact dependency edge.",
+		Status:     problemtrace.DirectionActive,
+		Priority:   100,
+		NextActions: []problemtrace.NextAction{{
+			ID:          "next-go-import-cycle",
+			Action:      "Inspect imports for repo/service and repo/handler.",
+			Tool:        "grep",
+			DirectionID: "dir-go-import-cycle",
+			Priority:    100,
+		}},
+	}
+	evidence := problemtrace.Evidence{
+		ID:      "evidence-1",
+		Summary: "package service imports handler and handler imports service",
+		Detail:  "go test output closes the dependency cycle through repo/service and repo/handler",
+		Source:  "tool_result",
+	}
+	frontier := problemtrace.InvestigationFrontier{
+		ActiveDirectionID:   "dir-go-import-cycle",
+		CandidateDirections: []string{"dir-go-import-cycle"},
+		RecommendedActions:  direction.NextActions,
+		OpenQuestions:       []string{"Which shared type or interface closes the cycle?"},
+		StopConditions:      []string{"Focused go test command passes after the dependency edge is removed."},
+		Risks:               []string{"Do not move code before confirming the exact import edge."},
+	}
+	traceContext := problemtrace.TraceContext{
+		TraceID:          traceID,
+		SpanID:           "span-4",
+		ParentSpanID:     "span-3",
+		DirectionID:      "dir-go-import-cycle",
+		PromptSnapshotID: "prompt-1",
+		Flags:            problemtrace.TraceFlags{Recording: true, Sampled: true},
+	}
+
+	return []core.Event{
+		{Type: "user_task", Data: map[string]any{"task": task, "repo": repo}},
+		{Type: "problem_trace_initialized", Data: map[string]any{
+			"trace_id": traceID,
+			"problem": problemtrace.ProblemContext{
+				UserTask:     task,
+				Repo:         repo,
+				ErrorSummary: "Go compile failed with import cycle not allowed: go test ./...",
+			},
+			"resource": problemtrace.TraceResource{RepoPath: repo, ModelProvider: "mock", Model: "mock"},
+		}},
+		{Type: "trace_span_ended", Data: map[string]any{"trace_context": problemtrace.TraceContext{TraceID: traceID, SpanID: "span-1"}, "span": runSpan}},
+		{Type: "trace_span_ended", Data: map[string]any{"trace_context": problemtrace.TraceContext{TraceID: traceID, SpanID: "span-2"}, "span": promptSpan}},
+		{Type: "prompt_snapshot", Data: map[string]any{"trace_context": problemtrace.TraceContext{TraceID: traceID, SpanID: "span-2", PromptSnapshotID: "prompt-1"}, "snapshot": prompt}},
+		{Type: "trace_span_ended", Data: map[string]any{"trace_context": problemtrace.TraceContext{TraceID: traceID, SpanID: "span-3", PromptSnapshotID: "prompt-1"}, "span": modelSpan}},
+		{Type: "trace_span_ended", Data: map[string]any{"trace_context": traceContext, "span": testSpan}},
+		{Type: "symptom_detected", Data: map[string]any{"trace_context": traceContext, "symptom": symptom}},
+		{Type: "direction_created", Data: map[string]any{"trace_context": traceContext, "direction": direction}},
+		{Type: "evidence_added", Data: map[string]any{"trace_context": traceContext, "direction_id": direction.ID, "evidence": evidence}},
+		{Type: "frontier_updated", Data: map[string]any{"trace_context": traceContext, "frontier": frontier}},
 	}
 }
 
@@ -497,6 +704,54 @@ func TestWideRunBodyShowsTimelineAndInspector(t *testing.T) {
 
 	if !strings.Contains(body, "Timeline") || !strings.Contains(body, "Inspector") || !strings.Contains(body, "[Plan]") {
 		t.Fatalf("expected wide cockpit body to include timeline and inspector, got:\n%s", body)
+	}
+}
+
+func TestWideTimelineShowsLatestItemsWhenOverflowing(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 12
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Now())
+	for i := 0; i < 18; i++ {
+		command := fmt.Sprintf("echo step-%02d", i)
+		model.tasks[taskIndex].Events = append(model.tasks[taskIndex].Events,
+			core.Event{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": command}}},
+			core.Event{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 0, "output": command}},
+		)
+	}
+	model.setSelectedTask(taskIndex)
+	model.resize()
+
+	body := model.bodyView()
+
+	if !strings.Contains(body, "Timeline") || !strings.Contains(body, "...") || !strings.Contains(body, "echo step-17") {
+		t.Fatalf("expected overflowing wide timeline to preserve header and latest item, got:\n%s", body)
+	}
+	if strings.Contains(body, "echo step-00") {
+		t.Fatalf("expected overflowing wide timeline to omit oldest items, got:\n%s", body)
+	}
+}
+
+func TestTimelineViewportFollowsLatestEvent(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 80
+	model.height = 12
+	model.resize()
+	model.startRun(core.Task{Text: "fix it"})
+	defer model.cancel()
+
+	model.addEvent(core.Event{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}})
+	for i := 0; i < 18; i++ {
+		command := fmt.Sprintf("echo step-%02d", i)
+		model.addEvent(core.Event{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": command}}})
+		model.addEvent(core.Event{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 0, "output": command}})
+	}
+
+	if model.detail.YOffset == 0 {
+		t.Fatalf("expected detail viewport to follow overflowing timeline, got yoffset=0\n%s", model.detail.View())
+	}
+	if !strings.Contains(model.detail.View(), "echo step-17") {
+		t.Fatalf("expected viewport to show latest timeline item, got:\n%s", model.detail.View())
 	}
 }
 

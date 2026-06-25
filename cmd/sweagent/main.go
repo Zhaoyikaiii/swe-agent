@@ -15,6 +15,7 @@ import (
 	"github.com/local/swe-agent/internal/core"
 	"github.com/local/swe-agent/internal/model"
 	"github.com/local/swe-agent/internal/policy"
+	"github.com/local/swe-agent/internal/problemtrace"
 	localruntime "github.com/local/swe-agent/internal/runtime"
 	"github.com/local/swe-agent/internal/tool"
 	"github.com/local/swe-agent/internal/trajectory"
@@ -196,6 +197,7 @@ func buildAgent(opts agentOptions, interactive bool) (*agentpkg.Agent, *tui.Sess
 		Trajectory: store,
 		Workspace:  ws,
 		EventSink:  eventSink,
+		Trace:      problemtrace.NewManager(),
 	}
 	return ag, tuiSession, store, nil
 }

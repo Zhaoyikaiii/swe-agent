@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/local/swe-agent/internal/core"
+	"github.com/local/swe-agent/internal/problemtrace"
 )
 
 type ActionParser interface {
@@ -49,6 +50,7 @@ type Agent struct {
 	Trajectory core.TrajectoryStore
 	Workspace  Workspace
 	EventSink  EventSink
+	Trace      *problemtrace.Manager
 }
 
 type EventSink interface {
@@ -73,6 +75,9 @@ func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
 		},
 	}
 	a.appendEvent(ctx, core.Event{Type: "user_task", Data: map[string]any{"task": task.Text, "repo": task.Repo}})
+	if a.Trace != nil {
+		a.appendEvents(ctx, a.Trace.StartRun(ctx, task, a.traceResource(task)))
+	}
 
 	var runErr error
 	for a.shouldContinue(state) {
@@ -105,22 +110,64 @@ func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
 		Usage:          state.Usage,
 		TrajectoryPath: a.Trajectory.Path(),
 	}
+	if a.Trace != nil {
+		a.appendEvents(ctx, a.Trace.FinishRun(ctx, result.Status, result.Submission))
+	}
 	a.appendEvent(ctx, core.Event{Type: "final", Data: map[string]any{"status": result.Status, "steps": result.Steps, "submission": result.Submission}})
 	return result, runErr
 }
 
 func (a *Agent) Step(ctx context.Context, state *State) error {
 	state.Steps++
+	messages := state.Messages
+	var promptSnapshot problemtrace.PromptSnapshot
+	var promptContext problemtrace.TraceContext
+	if a.Trace != nil {
+		promptResult := a.Trace.BuildPrompt(ctx, problemtrace.PromptInput{
+			Step:        state.Steps,
+			Model:       a.Config.Model.Model,
+			Provider:    a.Config.Model.Provider,
+			Messages:    state.Messages,
+			Tools:       a.Tools.List(),
+			Temperature: a.Config.Model.Temperature,
+			MaxTokens:   a.Config.Model.MaxTokens,
+			WorkingDir:  state.Task.Repo,
+		})
+		messages = promptResult.Messages
+		promptSnapshot = promptResult.Snapshot
+		promptContext = promptResult.Context
+		a.appendEvents(ctx, promptResult.Events)
+	}
 	req := core.ModelRequest{
-		Messages:    state.Messages,
+		Messages:    messages,
 		Tools:       a.Tools.List(),
 		Temperature: a.Config.Model.Temperature,
 		MaxTokens:   a.Config.Model.MaxTokens,
 		WorkingDir:  state.Task.Repo,
 	}
-	a.appendEvent(ctx, core.Event{Type: "model_request", Data: map[string]any{"step": state.Steps, "messages": len(req.Messages)}})
+	modelContext := promptContext
+	if a.Trace != nil {
+		var events []core.Event
+		modelContext, events = a.Trace.StartModelCall(ctx, state.Steps, promptSnapshot.ID, a.Config.Model.Provider, a.Config.Model.Model)
+		a.appendEvents(ctx, events)
+	}
+	requestData := map[string]any{
+		"step":            state.Steps,
+		"messages":        len(req.Messages),
+		"prompt_snapshot": buildPromptSnapshot(req),
+	}
+	if promptSnapshot.ID != "" {
+		requestData["prompt_snapshot_id"] = promptSnapshot.ID
+	}
+	if modelContext.TraceID != "" {
+		requestData["trace_context"] = modelContext
+	}
+	a.appendEvent(ctx, core.Event{Type: "model_request", Data: requestData})
 
 	resp, err := a.Model.Complete(ctx, req)
+	if a.Trace != nil {
+		a.appendEvents(ctx, a.Trace.EndModelCall(ctx, modelContext, resp, err))
+	}
 	if err != nil {
 		return fmt.Errorf("model complete: %w", err)
 	}
@@ -128,7 +175,11 @@ func (a *Agent) Step(ctx context.Context, state *State) error {
 	state.Usage.OutputTokens += resp.Usage.OutputTokens
 	state.Usage.CostUSD += resp.Usage.CostUSD
 	state.Messages = append(state.Messages, resp.Message)
-	a.appendEvent(ctx, core.Event{Type: "model_response", Data: map[string]any{"step": state.Steps, "content": resp.Message.Content, "usage": resp.Usage}})
+	responseData := map[string]any{"step": state.Steps, "content": resp.Message.Content, "usage": resp.Usage}
+	if modelContext.TraceID != "" {
+		responseData["trace_context"] = modelContext
+	}
+	a.appendEvent(ctx, core.Event{Type: "model_response", Data: responseData})
 
 	calls, err := a.Parser.Parse(resp)
 	if err != nil {
@@ -167,7 +218,17 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		return nil
 	}
 
-	a.appendEvent(ctx, core.Event{Type: "tool_call", Data: map[string]any{"tool": call.Name, "args": call.Args}})
+	var toolContext problemtrace.TraceContext
+	if a.Trace != nil {
+		var events []core.Event
+		toolContext, events = a.Trace.StartToolCall(ctx, state.Steps, call)
+		a.appendEvents(ctx, events)
+	}
+	callData := map[string]any{"tool": call.Name, "args": call.Args}
+	if toolContext.TraceID != "" {
+		callData["trace_context"] = toolContext
+	}
+	a.appendEvent(ctx, core.Event{Type: "tool_call", Data: callData})
 	result, err := t.Execute(ctx, core.ToolInput{
 		Call:          call,
 		Runtime:       a.Runtime,
@@ -178,7 +239,14 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		return fmt.Errorf("execute tool %s: %w", call.Name, err)
 	}
 	result = a.Policy.FilterObservation(ctx, result)
-	a.appendEvent(ctx, core.Event{Type: "tool_result", Data: map[string]any{"tool": call.Name, "code": result.Code, "timed_out": result.TimedOut, "output": result.Output}})
+	resultData := map[string]any{"tool": call.Name, "code": result.Code, "timed_out": result.TimedOut, "output": result.Output}
+	if toolContext.TraceID != "" {
+		resultData["trace_context"] = toolContext
+	}
+	a.appendEvent(ctx, core.Event{Type: "tool_result", Data: resultData})
+	if a.Trace != nil {
+		a.appendEvents(ctx, a.Trace.ObserveToolResult(ctx, toolContext, call, result))
+	}
 
 	if call.Name == "submit" || isSubmitOutput(result.Output) {
 		state.Submitted = true
@@ -195,6 +263,12 @@ func (a *Agent) appendEvent(ctx context.Context, event core.Event) {
 	_ = a.Trajectory.Append(ctx, event)
 	if a.EventSink != nil {
 		_ = a.EventSink.EmitEvent(ctx, event)
+	}
+}
+
+func (a *Agent) appendEvents(ctx context.Context, events []core.Event) {
+	for _, event := range events {
+		a.appendEvent(ctx, event)
 	}
 }
 
@@ -216,6 +290,99 @@ func (a *Agent) shouldContinue(state *State) bool {
 
 func (a *Agent) initialUserMessage(task core.Task) string {
 	return fmt.Sprintf("Task:\n%s\n\nRepository root: %s\n\nWork step by step. Inspect relevant files before editing. Run focused verification before submitting.", task.Text, task.Repo)
+}
+
+func (a *Agent) traceResource(task core.Task) problemtrace.TraceResource {
+	return problemtrace.TraceResource{
+		RepoPath:      task.Repo,
+		RepoLanguage:  "unknown",
+		AgentVersion:  "dev",
+		Runtime:       a.Config.Runtime.Type,
+		ModelProvider: a.Config.Model.Provider,
+		Model:         a.Config.Model.Model,
+	}
+}
+
+func buildPromptSnapshot(req core.ModelRequest) map[string]any {
+	blocks := []map[string]any{
+		promptBlock("System Rules", countMessages(req.Messages, core.RoleSystem), "agent system prompt"),
+		promptBlock("User Task", countMessages(req.Messages, core.RoleUser), "current task and repository root"),
+		promptBlock("Recent Observations", countMessages(req.Messages, core.RoleTool), "tool observations from this run"),
+		promptBlock("Conversation State", countMessages(req.Messages, core.RoleAssistant), "visible assistant responses from this run"),
+		promptBlock("Tool Schema", len(req.Tools), "available tool names and schemas"),
+		promptBlock("Investigation Frontier", 0, "not yet injected by the agent loop"),
+		promptBlock("Memory Context", 0, "not yet injected by the agent loop"),
+	}
+	return map[string]any{
+		"working_dir":     req.WorkingDir,
+		"temperature":     req.Temperature,
+		"max_tokens":      req.MaxTokens,
+		"message_count":   len(req.Messages),
+		"tool_count":      len(req.Tools),
+		"token_estimate":  estimatePromptTokens(req.Messages, req.Tools),
+		"blocks":          blocks,
+		"message_summary": summarizePromptMessages(req.Messages),
+	}
+}
+
+func promptBlock(name string, count int, summary string) map[string]any {
+	return map[string]any{
+		"name":     name,
+		"count":    count,
+		"included": count > 0,
+		"summary":  summary,
+	}
+}
+
+func countMessages(messages []core.Message, role core.Role) int {
+	count := 0
+	for _, msg := range messages {
+		if msg.Role == role {
+			count++
+		}
+	}
+	return count
+}
+
+func estimatePromptTokens(messages []core.Message, tools []core.ToolSpec) int {
+	chars := 0
+	for _, msg := range messages {
+		chars += len([]rune(msg.Content))
+	}
+	for _, tool := range tools {
+		chars += len([]rune(tool.Name)) + len([]rune(tool.Description))
+	}
+	if chars == 0 {
+		return 0
+	}
+	return chars/4 + 1
+}
+
+func summarizePromptMessages(messages []core.Message) []map[string]any {
+	summaries := make([]map[string]any, 0, len(messages))
+	for i, msg := range messages {
+		name := strings.TrimSpace(msg.Name)
+		summaries = append(summaries, map[string]any{
+			"index":   i + 1,
+			"role":    string(msg.Role),
+			"name":    name,
+			"chars":   len([]rune(msg.Content)),
+			"summary": shortPromptContent(msg.Content, 240),
+		})
+	}
+	return summaries
+}
+
+func shortPromptContent(content string, limit int) string {
+	content = strings.Join(strings.Fields(content), " ")
+	runes := []rune(content)
+	if len(runes) <= limit {
+		return content
+	}
+	if limit <= 3 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-3]) + "..."
 }
 
 func (a *Agent) validate() error {

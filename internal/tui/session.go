@@ -150,6 +150,21 @@ const (
 	viewTrace
 )
 
+type traceTab int
+
+const (
+	traceTabTrace traceTab = iota
+	traceTabFrontier
+	traceTabMemory
+	traceTabEvents
+	traceTabPrompt
+	traceTabCards
+)
+
+type traceWorkspaceState struct {
+	Tab traceTab
+}
+
 type sidebarMode int
 
 const (
@@ -250,6 +265,7 @@ type model struct {
 	phaseHint  string
 	pendingKey string
 	startedAt  time.Time
+	traceView  traceWorkspaceState
 }
 
 func newRunModel(session *Session, ag *agentpkg.Agent, task core.Task, parent context.Context) *model {
@@ -446,6 +462,24 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 	keyString := msg.String()
+	if m.view == viewTrace {
+		switch keyString {
+		case "q", "esc":
+			m.view = viewOverview
+			m.status = "run overview"
+			m.updateDetail()
+			return nil
+		case "tab", "l", "right":
+			m.cycleTraceTab(1)
+			return nil
+		case "shift+tab", "h", "left":
+			m.cycleTraceTab(-1)
+			return nil
+		case "1", "2", "3", "4", "5", "6":
+			m.setTraceTab(keyString)
+			return nil
+		}
+	}
 	if m.handlePendingKey(keyString) {
 		return nil
 	}
@@ -513,7 +547,7 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 	case "x":
 		m.view = viewTrace
 		m.focus = "detail"
-		m.status = "trajectory: " + m.trajectoryPath()
+		m.status = "trace workspace"
 		m.updateDetail()
 	case "t":
 		m.showRun()
@@ -735,7 +769,7 @@ func (m *model) executeCommand(command string) tea.Cmd {
 	case "trace":
 		m.view = viewTrace
 		m.focus = "detail"
-		m.status = "trajectory: " + m.trajectoryPath()
+		m.status = "trace workspace"
 		m.updateDetail()
 	case "open-trace":
 		return m.openTrace()
@@ -775,7 +809,7 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 	case "trace":
 		m.view = viewTrace
 		m.focus = "detail"
-		m.status = "trajectory: " + m.trajectoryPath()
+		m.status = "trace workspace"
 		m.updateDetail()
 	case "open-trace":
 		return m.openTrace()
@@ -1163,6 +1197,7 @@ func (m *model) finishActiveTask(result agentpkg.Result, err error) {
 		m.selected = -1
 		m.saveSelectedTaskView()
 		m.updateDetail()
+		m.followTimelineBottom()
 	} else if wasViewingTask {
 		m.updateDetail()
 	}
@@ -1182,8 +1217,12 @@ func (m *model) addEvent(event core.Event) {
 			m.selected = -1
 			m.saveSelectedTaskView()
 			m.updateDetail()
+			if follow {
+				m.followTimelineBottom()
+			}
 		} else if follow || m.selected < 0 {
 			m.selectIndex(len(record.Chat) - 1)
+			m.followTimelineBottom()
 		} else {
 			m.updateDetail()
 		}
@@ -1373,6 +1412,39 @@ func (m *model) toggleFocus() {
 	} else {
 		m.focus = "sidebar"
 	}
+}
+
+func (m *model) cycleTraceTab(delta int) {
+	total := int(traceTabCards) + 1
+	next := (int(m.traceView.Tab) + delta + total) % total
+	m.traceView.Tab = traceTab(next)
+	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
+	m.updateDetail()
+}
+
+func (m *model) followTimelineBottom() {
+	if m.sidebar == sidebarRun && m.view == viewOverview {
+		m.detail.GotoBottom()
+	}
+}
+
+func (m *model) setTraceTab(key string) {
+	switch key {
+	case "1":
+		m.traceView.Tab = traceTabTrace
+	case "2":
+		m.traceView.Tab = traceTabFrontier
+	case "3":
+		m.traceView.Tab = traceTabMemory
+	case "4":
+		m.traceView.Tab = traceTabEvents
+	case "5":
+		m.traceView.Tab = traceTabPrompt
+	case "6":
+		m.traceView.Tab = traceTabCards
+	}
+	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
+	m.updateDetail()
 }
 
 func (m *model) showHistory() {
@@ -1614,7 +1686,10 @@ func (m *model) detailContent() string {
 		}
 		return "No validation yet."
 	case viewTrace:
-		return "Trajectory\n\n" + m.trajectoryPath()
+		if record := m.selectedTaskRecord(); record != nil {
+			return traceWorkspaceViewWidth(*record, m.traceView, m.detail.Width, m.trajectoryPath())
+		}
+		return "Problem Trace\n\nNo run selected."
 	default:
 		if m.approval != nil {
 			return approvalDetail(m.approval)
@@ -1763,7 +1838,7 @@ func (m *model) bodyView() string {
 				Width(timelineWidth).
 				Height(contentHeight).
 				BorderForeground(focusColor(m.focus != "detail")).
-				Render(fitHeight(m.timelinePanel(timelineWidth-2), contentHeight))
+				Render(fitHeightHeadTail(m.timelinePanel(timelineWidth-2), contentHeight))
 			inspector := panelStyle.
 				Width(inspectorWidth).
 				Height(contentHeight).
@@ -1828,9 +1903,7 @@ func (m *model) inspectorView(width int) string {
 	case viewTests:
 		b.WriteString(validationViewWidth(snapshot, width))
 	case viewTrace:
-		b.WriteString("Trajectory\n\n")
-		b.WriteString(m.trajectoryPath())
-		b.WriteByte('\n')
+		b.WriteString(traceWorkspaceViewWidth(*record, m.traceView, width, m.trajectoryPath()))
 	default:
 		b.WriteString(planInspectorWidth(*record, snapshot, width))
 	}
@@ -3079,6 +3152,28 @@ func fitHeight(content string, height int) string {
 			return truncate(lines[0], max(1, len([]rune(lines[0]))))
 		}
 		lines = append(lines[:height-1], "...")
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func fitHeightHeadTail(content string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) > height {
+		if height == 1 {
+			return truncate(lines[0], max(1, len([]rune(lines[0]))))
+		}
+		if height == 2 {
+			lines = []string{lines[0], "..."}
+		} else {
+			tail := append([]string(nil), lines[len(lines)-(height-2):]...)
+			lines = append([]string{lines[0], "..."}, tail...)
+		}
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
