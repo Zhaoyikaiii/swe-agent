@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	agentpkg "github.com/local/swe-agent/internal/agent"
 	"github.com/local/swe-agent/internal/core"
+	"github.com/local/swe-agent/internal/policy"
 )
 
 func TestLoopSlashClearResetsVisibleSession(t *testing.T) {
@@ -111,8 +112,8 @@ func TestLateFinalEventStaysOnActiveTaskAfterRunDone(t *testing.T) {
 	if got := len(model.tasks[0].Chat); got != 1 {
 		t.Fatalf("expected summary to be upserted once, got %d chat entries", got)
 	}
-	if !strings.Contains(model.detailContent(), "Agent summary: done") {
-		t.Fatalf("expected summary detail, got:\n%s", model.detailContent())
+	if !strings.Contains(model.detailContent(), "Final Review") || !strings.Contains(model.detailContent(), "done") {
+		t.Fatalf("expected final review detail, got:\n%s", model.detailContent())
 	}
 }
 
@@ -142,8 +143,8 @@ func TestSummaryDoesNotTreatSubmittedPlaceholderAsConclusion(t *testing.T) {
 	model.addEvent(core.Event{Type: "final", Data: map[string]any{"status": "submitted", "steps": 1, "submission": "submitted"}})
 
 	detail := model.detailContent()
-	if !strings.Contains(detail, "No final summary text was") || !strings.Contains(detail, "submitted.") {
-		t.Fatalf("expected missing-summary message, got:\n%s", detail)
+	if !strings.Contains(detail, "Final Review") || !strings.Contains(detail, "Status: submitted") {
+		t.Fatalf("expected final review without placeholder submission, got:\n%s", detail)
 	}
 	if strings.Contains(detail, "Agent summary: submitted") {
 		t.Fatalf("expected submitted placeholder to be ignored, got:\n%s", detail)
@@ -175,14 +176,11 @@ func TestErrorFinalSelectsSummaryWithErrorText(t *testing.T) {
 	model.addEvent(core.Event{Type: "error", Data: map[string]any{"error": "codex failed with stderr"}})
 	model.addEvent(core.Event{Type: "final", Data: map[string]any{"status": "error", "steps": 1}})
 
-	if model.selected != 1 {
-		t.Fatalf("expected summary chat entry to be selected, got index %d", model.selected)
-	}
-	if got := model.selectedChat()[model.selected].Role; got != "summary" {
-		t.Fatalf("expected selected chat role summary, got %q", got)
+	if model.selected != -1 {
+		t.Fatalf("expected final review to be selected, got index %d", model.selected)
 	}
 	if !strings.Contains(model.detailContent(), "codex failed with stderr") {
-		t.Fatalf("expected summary detail to include error text, got:\n%s", model.detailContent())
+		t.Fatalf("expected final review to include error text, got:\n%s", model.detailContent())
 	}
 }
 
@@ -223,8 +221,9 @@ func TestSlashHistoryShowsTaskHistoryAndTaskDetail(t *testing.T) {
 	}
 }
 
-func TestHistoryEnterSwitchesSelectedTaskChat(t *testing.T) {
+func TestHistoryEnterSwitchesSelectedTaskWorkbench(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.detail.Width = 80
 	first := model.createTaskRecord(core.Task{Text: "first task", Repo: "/repo"}, "submitted", time.Now())
 	model.tasks[first].Events = []core.Event{{Type: "tool_call", Data: map[string]any{"tool": "grep"}}}
 	model.tasks[first].Chat = []chatEntry{{Role: "summary", Title: "Summary", Body: "first summary"}}
@@ -243,8 +242,11 @@ func TestHistoryEnterSwitchesSelectedTaskChat(t *testing.T) {
 	if model.selectedTask != first {
 		t.Fatalf("expected first task to remain selected, got %d", model.selectedTask)
 	}
-	if got := model.selectedChat()[model.selected].Body; got != "first summary" {
-		t.Fatalf("expected first task chat detail, got %v", got)
+	if model.selected != -1 {
+		t.Fatalf("expected final review selection after task switch, got %d", model.selected)
+	}
+	if detail := model.detailContent(); !strings.Contains(detail, "Final Review") || !strings.Contains(detail, "Status: submitted") {
+		t.Fatalf("expected first task workbench detail, got:\n%s", detail)
 	}
 }
 
@@ -269,5 +271,143 @@ func TestEventDetailRendersStructuredDataInsteadOfRawJSON(t *testing.T) {
 	}
 	if strings.Contains(detail, "\"command\"") || strings.Contains(detail, "{") || strings.Contains(detail, "}") {
 		t.Fatalf("expected structured rendering without raw JSON, got:\n%s", detail)
+	}
+}
+
+func TestAgentAndToolEventsAppearInSessionTimeline(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.detail.Width = 80
+	model.startRun(core.Task{Text: "fix it"})
+	defer model.cancel()
+
+	model.addEvent(core.Event{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}})
+	model.addEvent(core.Event{Type: "model_response", Data: map[string]any{"content": "I will inspect the tests."}})
+	model.addEvent(core.Event{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "go test ./..."}}})
+	model.addEvent(core.Event{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 0, "output": "ok"}})
+
+	chat := model.selectedChat()
+	if len(chat) != 4 {
+		t.Fatalf("expected task plus three timeline entries, got %d: %#v", len(chat), chat)
+	}
+	for _, want := range []string{"Agent", "Tool", "Result"} {
+		found := false
+		for _, entry := range chat {
+			if entry.Title == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected timeline entry %q in %#v", want, chat)
+		}
+	}
+	if got := chatLine(chat[1]); !strings.Contains(got, "Agent") || !strings.Contains(got, "inspect") {
+		t.Fatalf("expected readable agent timeline line, got %q", got)
+	}
+}
+
+func TestPhaseHintsFollowRunLifecycle(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 100
+
+	if model.phase != phaseReady || model.phaseLabel() != "Ready" {
+		t.Fatalf("expected ready phase, got %v %q", model.phase, model.phaseLabel())
+	}
+
+	model.startRun(core.Task{Text: "fix it"})
+	defer model.cancel()
+	if model.phase != phaseThinking {
+		t.Fatalf("expected thinking phase after start, got %v", model.phase)
+	}
+
+	model.addEvent(core.Event{Type: "tool_call", Data: map[string]any{"tool": "shell"}})
+	if model.phase != phaseTool {
+		t.Fatalf("expected tool phase, got %v", model.phase)
+	}
+	if !strings.Contains(model.phaseLabel(), "tool") || !strings.Contains(model.statusHint(), "shell") {
+		t.Fatalf("expected tool phase hint for shell, got label=%q hint=%q", model.phaseLabel(), model.statusHint())
+	}
+
+	response := make(chan policy.ApprovalDecision, 1)
+	model.Update(approvalMsg{
+		request: policy.ApprovalRequest{
+			Call: core.ToolCall{Name: "apply_patch"},
+			Spec: core.ToolSpec{Name: "apply_patch"},
+			Risk: core.RiskWrite,
+		},
+		response: response,
+	})
+	if model.phase != phaseApproval {
+		t.Fatalf("expected approval phase, got %v", model.phase)
+	}
+	if !strings.Contains(model.phaseLabel(), "approval") || !strings.Contains(model.statusHint(), "apply_patch") {
+		t.Fatalf("expected approval phase hint for apply_patch, got label=%q hint=%q", model.phaseLabel(), model.statusHint())
+	}
+
+	model.answerApproval(policy.ApprovalDecision{Allowed: true})
+	model.Update(runDoneMsg{result: agentpkg.Result{Status: "submitted", Steps: 3}, err: nil})
+	if model.phase != phaseFinished {
+		t.Fatalf("expected finished phase, got %v", model.phase)
+	}
+	if !strings.Contains(model.footerView(), "Finished") {
+		t.Fatalf("expected footer to expose finished phase, got %q", model.footerView())
+	}
+}
+
+func TestBuildRunSnapshotGroupsActionObservationAndArtifacts(t *testing.T) {
+	start := time.Unix(100, 0)
+	record := taskRecord{
+		Task:   core.Task{Text: "fix failing test", Repo: "/repo"},
+		Status: "submitted",
+		Events: []core.Event{
+			{Type: "model_response", Time: start, Data: map[string]any{"content": "I will run the focused test."}},
+			{Type: "tool_call", Time: start.Add(time.Second), Data: map[string]any{"tool": "run_tests", "args": map[string]any{"command": "go test ./internal/tui"}}},
+			{Type: "tool_result", Time: start.Add(3 * time.Second), Data: map[string]any{"tool": "run_tests", "code": 1, "output": "FAIL TestX"}},
+		},
+		Result: agentpkg.Result{
+			Status: "submitted",
+			Steps:  1,
+			Diff:   "diff --git a/internal/tui/session.go b/internal/tui/session.go\n",
+		},
+	}
+
+	snapshot := BuildRunSnapshot(record, "/tmp/run.jsonl")
+
+	if len(snapshot.Steps) != 1 {
+		t.Fatalf("expected one grouped step, got %#v", snapshot.Steps)
+	}
+	step := snapshot.Steps[0]
+	if step.Phase != "validate" || step.Command != "go test ./internal/tui" || step.Outcome != "exit 1" {
+		t.Fatalf("unexpected step summary: %#v", step)
+	}
+	if !strings.Contains(step.Why, "focused test") || !strings.Contains(step.Output, "FAIL TestX") {
+		t.Fatalf("expected why and observation to be preserved: %#v", step)
+	}
+	if snapshot.FinalReview.ChangedFiles != 1 || snapshot.FinalReview.TestsRun != 1 || snapshot.FinalReview.TestsPassed != 0 {
+		t.Fatalf("unexpected final review counters: %#v", snapshot.FinalReview)
+	}
+	if snapshot.FinalReview.Trajectory != "/tmp/run.jsonl" {
+		t.Fatalf("expected trajectory path, got %q", snapshot.FinalReview.Trajectory)
+	}
+}
+
+func TestSlashTestsShowsValidationView(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.detail.Width = 80
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "submitted", time.Now())
+	model.tasks[taskIndex].Events = []core.Event{
+		{Type: "tool_call", Data: map[string]any{"tool": "run_tests", "args": map[string]any{"command": "go test ./..."}}},
+		{Type: "tool_result", Data: map[string]any{"tool": "run_tests", "code": 0, "output": "ok"}},
+	}
+	model.setSelectedTask(taskIndex)
+
+	model.executeSlashCommand("/tests")
+
+	if model.view != viewTests {
+		t.Fatalf("expected tests view, got %v", model.view)
+	}
+	detail := model.detailContent()
+	if !strings.Contains(detail, "Validation") || !strings.Contains(detail, "go test ./...") || !strings.Contains(detail, "Status: ok") {
+		t.Fatalf("expected validation detail, got:\n%s", detail)
 	}
 }

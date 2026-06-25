@@ -139,6 +139,7 @@ type detailView int
 const (
 	viewEvent detailView = iota
 	viewDiff
+	viewTests
 	viewTrace
 )
 
@@ -147,6 +148,20 @@ type sidebarMode int
 const (
 	sidebarChat sidebarMode = iota
 	sidebarHistory
+)
+
+type runPhase int
+
+const (
+	phaseStarting runPhase = iota
+	phaseReady
+	phaseThinking
+	phaseProcessing
+	phaseTool
+	phaseApproval
+	phaseFinished
+	phaseError
+	phaseCanceled
 )
 
 type chatEntry struct {
@@ -216,6 +231,8 @@ type model struct {
 
 	query      string
 	status     string
+	phase      runPhase
+	phaseHint  string
 	pendingKey string
 	startedAt  time.Time
 }
@@ -224,6 +241,7 @@ func newRunModel(session *Session, ag *agentpkg.Agent, task core.Task, parent co
 	m := newModel(session, ag, task, parent)
 	m.start = true
 	m.status = "starting"
+	m.setPhase(phaseStarting, "starting agent")
 	return m
 }
 
@@ -232,6 +250,7 @@ func newLoopModel(session *Session, ag *agentpkg.Agent, repo string, parent cont
 	m.loop = true
 	m.mode = modeTask
 	m.status = "ready"
+	m.setPhase(phaseReady, "enter a task")
 	m.prepareTaskInput(true)
 	return m
 }
@@ -271,6 +290,8 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, parent conte
 		spinner:      spin,
 		command:      command,
 		status:       "starting",
+		phase:        phaseStarting,
+		phaseHint:    "starting agent",
 		startedAt:    time.Now(),
 	}
 }
@@ -330,6 +351,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.approval = &approvalState{msg: msg}
 		m.mode = modeApproval
 		m.status = fmt.Sprintf("approval required: %s (%s)", msg.request.Call.Name, msg.request.Risk)
+		m.setPhase(phaseApproval, fmt.Sprintf("%s requires %s approval", msg.request.Call.Name, msg.request.Risk))
 		m.view = viewEvent
 		m.updateDetail()
 		cmds = append(cmds, waitForApproval(m.session.approvals))
@@ -342,8 +364,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.finishActiveTask(msg.result, msg.err)
 		if msg.err != nil {
 			m.status = "error: " + msg.err.Error()
+			m.setPhase(phaseError, msg.err.Error())
 		} else {
 			m.status = "finished: " + msg.result.Status
+			m.setPhase(phaseFinished, valueOrDefault(msg.result.Status, "finished"))
 		}
 		m.updateDetail()
 		if m.loop && m.approval == nil {
@@ -578,6 +602,7 @@ func (m *model) handleQuitConfirmKey(msg tea.KeyMsg) tea.Cmd {
 		if m.cancel != nil {
 			m.cancel()
 		}
+		m.setPhase(phaseCanceled, "run canceled")
 		return tea.Quit
 	case "n", "esc":
 		m.mode = modeNormal
@@ -604,7 +629,7 @@ func (m *model) openCommandMode(prompt string) tea.Cmd {
 	m.mode = modeCommand
 	m.command.Reset()
 	m.command.Prompt = prompt
-	m.command.Width = max(10, m.width-4)
+	m.command.Width = max(10, m.width-16)
 	return m.command.Focus()
 }
 
@@ -612,7 +637,7 @@ func (m *model) openSearchMode() tea.Cmd {
 	m.mode = modeSearch
 	m.command.Reset()
 	m.command.Prompt = "/"
-	m.command.Width = max(10, m.width-4)
+	m.command.Width = max(10, m.width-16)
 	return m.command.Focus()
 }
 
@@ -643,6 +668,10 @@ func (m *model) executeCommand(command string) tea.Cmd {
 		m.openHelp()
 	case "d", "diff":
 		m.view = viewDiff
+		m.focus = "detail"
+		m.updateDetail()
+	case "tests", "validation":
+		m.view = viewTests
 		m.focus = "detail"
 		m.updateDetail()
 	case "t", "timeline", "events", "chat":
@@ -679,6 +708,10 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 		m.view = viewDiff
 		m.focus = "detail"
 		m.updateDetail()
+	case "tests", "validation":
+		m.view = viewTests
+		m.focus = "detail"
+		m.updateDetail()
 	case "t", "timeline", "events", "chat":
 		m.showChat()
 	case "history", "tasks":
@@ -709,7 +742,7 @@ func (m *model) prepareTaskInput(reset bool) {
 	m.mode = modeTask
 	m.command.Prompt = "task> "
 	m.command.Placeholder = "type a task or /history"
-	m.command.Width = max(10, m.width-4)
+	m.command.Width = max(10, m.width-18)
 	if reset {
 		m.command.Reset()
 	}
@@ -748,6 +781,7 @@ func (m *model) startRun(task core.Task) tea.Cmd {
 	m.sidebar = sidebarChat
 	m.focus = "sidebar"
 	m.status = "running task: " + shortString(task.Text, 48)
+	m.setPhase(phaseThinking, "preparing task")
 	m.updateDetail()
 	return runAgent(m.runCtx, m.agent, m.task)
 }
@@ -775,6 +809,7 @@ func (m *model) clearSession() {
 	m.detail.GotoTop()
 	m.drainEvents()
 	m.status = "cleared"
+	m.setPhase(phaseReady, "enter a task")
 	m.updateDetail()
 }
 
@@ -810,8 +845,10 @@ func (m *model) answerApproval(decision policy.ApprovalDecision) {
 	m.approval.msg.response <- decision
 	if decision.Allowed {
 		m.status = "approved: " + m.approval.msg.request.Call.Name
+		m.setPhase(phaseProcessing, "approval accepted")
 	} else {
 		m.status = "denied: " + m.approval.msg.request.Call.Name
+		m.setPhase(phaseProcessing, "approval denied")
 	}
 	m.approval = nil
 	m.mode = modeNormal
@@ -875,6 +912,18 @@ func (m *model) selectedResult() agentpkg.Result {
 	return record.Result
 }
 
+func (m *model) selectedSteps() []StepCard {
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return nil
+	}
+	return m.runSnapshot(*record).Steps
+}
+
+func (m *model) runSnapshot(record taskRecord) RunSnapshot {
+	return BuildRunSnapshot(record, m.trajectoryPath())
+}
+
 func (m *model) saveSelectedTaskView() {
 	if record := m.selectedTaskRecord(); record != nil {
 		record.Selected = m.selected
@@ -892,12 +941,18 @@ func (m *model) setSelectedTask(index int) {
 	}
 	m.selectedTask = clamp(index, 0, len(m.tasks)-1)
 	record := m.selectedTaskRecord()
-	if record == nil || len(record.Chat) == 0 {
+	if record == nil {
 		m.selected = -1
 		m.chatOffset = 0
 		return
 	}
-	m.selected = clamp(record.Selected, 0, len(record.Chat)-1)
+	steps := m.selectedSteps()
+	if record.Selected < 0 || len(steps) == 0 {
+		m.selected = -1
+		m.chatOffset = max(0, record.ChatOffset)
+		return
+	}
+	m.selected = clamp(record.Selected, 0, len(steps)-1)
 	m.chatOffset = max(0, record.ChatOffset)
 	m.ensureChatVisible()
 }
@@ -988,6 +1043,69 @@ func (m *model) updateTaskChat(record *taskRecord, event core.Event) {
 			Body:  body,
 			Time:  event.Time,
 		})
+	case "model_response":
+		body := strings.TrimSpace(fmt.Sprint(event.Data["content"]))
+		if body == "" {
+			return
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "assistant",
+			Title: "Agent",
+			Body:  body,
+			Time:  event.Time,
+		})
+	case "tool_call":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		body := "Running " + toolName
+		if args, ok := event.Data["args"]; ok {
+			if formatted := strings.TrimSpace(formatArgsMap(args)); formatted != "" && formatted != "empty" {
+				body += "\n\n" + formatted
+			}
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "tool",
+			Title: "Tool",
+			Body:  body,
+			Time:  event.Time,
+		})
+	case "tool_result":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		code := strings.TrimSpace(fmt.Sprint(event.Data["code"]))
+		status := "ok"
+		if code != "" && code != "0" && code != "<nil>" {
+			status = "exit " + code
+		}
+		body := fmt.Sprintf("%s finished: %s", toolName, status)
+		if output := strings.TrimSpace(fmt.Sprint(event.Data["output"])); output != "" && output != "<nil>" {
+			body += "\n\n" + output
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "result",
+			Title: "Result",
+			Body:  body,
+			Time:  event.Time,
+		})
+	case "tool_denied":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		body := toolName + " denied"
+		if reason := strings.TrimSpace(fmt.Sprint(event.Data["reason"])); reason != "" && reason != "<nil>" {
+			body += "\n\n" + reason
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "denied",
+			Title: "Denied",
+			Body:  body,
+			Time:  event.Time,
+		})
 	case "error":
 		body := strings.TrimSpace(fmt.Sprint(event.Data["error"]))
 		if body == "" {
@@ -1025,7 +1143,9 @@ func (m *model) finishActiveTask(result agentpkg.Result, err error) {
 	record.Summary = taskSummary(*record)
 	m.upsertSummaryEntry(record, time.Now())
 	if wasViewingTask && follow {
-		m.selectIndex(len(record.Chat) - 1)
+		m.selected = -1
+		m.saveSelectedTaskView()
+		m.updateDetail()
 	} else if wasViewingTask {
 		m.updateDetail()
 	}
@@ -1041,7 +1161,11 @@ func (m *model) addEvent(event core.Event) {
 	m.updateTaskChat(record, event)
 
 	if wasViewingTask && m.sidebar == sidebarChat {
-		if follow || m.selected < 0 {
+		if event.Type == "final" {
+			m.selected = -1
+			m.saveSelectedTaskView()
+			m.updateDetail()
+		} else if follow || m.selected < 0 {
 			m.selectIndex(len(record.Chat) - 1)
 		} else {
 			m.updateDetail()
@@ -1050,6 +1174,97 @@ func (m *model) addEvent(event core.Event) {
 		m.updateDetail()
 	}
 	m.status = summarizeEvent(event)
+	m.updatePhaseFromEvent(event)
+}
+
+func (m *model) setPhase(phase runPhase, hint string) {
+	m.phase = phase
+	m.phaseHint = strings.TrimSpace(hint)
+}
+
+func (m *model) updatePhaseFromEvent(event core.Event) {
+	switch event.Type {
+	case "user_task":
+		m.setPhase(phaseThinking, "preparing task")
+	case "model_request":
+		m.setPhase(phaseThinking, "waiting for model")
+	case "model_response":
+		m.setPhase(phaseProcessing, "processing model response")
+	case "tool_call":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		m.setPhase(phaseTool, "running "+toolName)
+	case "tool_result":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		m.setPhase(phaseProcessing, toolName+" finished")
+	case "tool_denied":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		m.setPhase(phaseProcessing, toolName+" denied")
+	case "error":
+		m.setPhase(phaseError, shortString(event.Data["error"], 80))
+	case "final":
+		status := strings.TrimSpace(fmt.Sprint(event.Data["status"]))
+		m.setPhase(phaseFinished, valueOrDefault(status, "finished"))
+	}
+}
+
+func (m *model) phaseLabel() string {
+	switch m.phase {
+	case phaseStarting:
+		return "Starting"
+	case phaseReady:
+		return "Ready"
+	case phaseThinking:
+		return "Thinking"
+	case phaseProcessing:
+		return "Processing"
+	case phaseTool:
+		return "Running tool"
+	case phaseApproval:
+		return "Waiting approval"
+	case phaseFinished:
+		return "Finished"
+	case phaseError:
+		return "Error"
+	case phaseCanceled:
+		return "Canceled"
+	default:
+		return "Ready"
+	}
+}
+
+func (m *model) statusHint() string {
+	if hint := strings.TrimSpace(m.phaseHint); hint != "" {
+		return hint
+	}
+	switch m.phase {
+	case phaseReady:
+		return "enter a task"
+	case phaseThinking:
+		return "waiting for model"
+	case phaseProcessing:
+		return "processing"
+	case phaseTool:
+		return "running tool"
+	case phaseApproval:
+		return "waiting for approval"
+	case phaseFinished:
+		return "finished"
+	case phaseError:
+		return "error"
+	case phaseCanceled:
+		return "canceled"
+	default:
+		return "starting"
+	}
 }
 
 func (m *model) moveSelection(delta int) {
@@ -1061,11 +1276,11 @@ func (m *model) moveSelection(delta int) {
 }
 
 func (m *model) moveChatSelection(delta int) {
-	chat := m.selectedChat()
-	if len(chat) == 0 {
+	steps := m.selectedSteps()
+	if len(steps) == 0 {
 		return
 	}
-	m.selectIndex(clamp(m.selected+delta, 0, len(chat)-1))
+	m.selectIndex(clamp(m.selected+delta, 0, len(steps)-1))
 }
 
 func (m *model) moveTaskSelection(delta int) {
@@ -1076,14 +1291,14 @@ func (m *model) moveTaskSelection(delta int) {
 }
 
 func (m *model) selectIndex(index int) {
-	chat := m.selectedChat()
-	if len(chat) == 0 {
+	steps := m.selectedSteps()
+	if len(steps) == 0 {
 		m.selected = -1
 		m.saveSelectedTaskView()
 		m.updateDetail()
 		return
 	}
-	m.selected = clamp(index, 0, len(chat)-1)
+	m.selected = clamp(index, 0, len(steps)-1)
 	m.ensureChatVisible()
 	m.saveSelectedTaskView()
 	m.updateDetail()
@@ -1115,7 +1330,7 @@ func (m *model) selectLast() {
 		m.selectTaskIndex(len(m.tasks) - 1)
 		return
 	}
-	m.selectIndex(len(m.selectedChat()) - 1)
+	m.selectIndex(len(m.selectedSteps()) - 1)
 }
 
 func (m *model) centerSelection() {
@@ -1200,9 +1415,9 @@ func (m *model) findMatch(direction int) {
 }
 
 func (m *model) findChatMatch(direction int) {
-	chat := m.selectedChat()
-	if len(chat) == 0 {
-		m.status = "no chat to search"
+	steps := m.selectedSteps()
+	if len(steps) == 0 {
+		m.status = "no steps to search"
 		return
 	}
 	needle := strings.ToLower(m.query)
@@ -1210,9 +1425,9 @@ func (m *model) findChatMatch(direction int) {
 	if start < 0 {
 		start = 0
 	}
-	for i := 1; i <= len(chat); i++ {
-		idx := (start + direction*i + len(chat)*2) % len(chat)
-		haystack := strings.ToLower(chatLine(chat[idx]) + "\n" + chatDetailWidth(chat[idx], m.detail.Width))
+	for i := 1; i <= len(steps); i++ {
+		idx := (start + direction*i + len(steps)*2) % len(steps)
+		haystack := strings.ToLower(stepLine(steps[idx]) + "\n" + stepDetailWidth(steps[idx], m.detail.Width))
 		if strings.Contains(haystack, needle) {
 			m.selectIndex(idx)
 			m.status = fmt.Sprintf("match %d: %s", idx+1, m.query)
@@ -1251,7 +1466,7 @@ func (m *model) resize() {
 	m.detail.Width = detailWidth - 2
 	m.detail.Height = bodyHeight - 2
 	m.help.Width = m.width
-	m.command.Width = max(10, m.width-4)
+	m.command.Width = max(10, m.width-18)
 	if m.sidebar == sidebarHistory {
 		m.ensureHistoryVisible()
 	} else {
@@ -1261,12 +1476,12 @@ func (m *model) resize() {
 }
 
 func (m *model) bodyHeight() int {
-	reserved := 4
+	reserved := 5
 	if m.approval != nil {
 		reserved += lipgloss.Height(m.approvalView(max(1, m.width-2)))
 	}
 	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
-		reserved += 1
+		reserved += 3
 	}
 	return max(1, m.height-reserved)
 }
@@ -1280,7 +1495,8 @@ func (m *model) sidebarWidth() int {
 
 func (m *model) ensureChatVisible() {
 	bodyHeight := m.sidebarListHeight()
-	if m.selected < 0 || bodyHeight <= 0 {
+	steps := m.selectedSteps()
+	if m.selected < 0 || len(steps) == 0 || bodyHeight <= 0 {
 		m.chatOffset = 0
 		return
 	}
@@ -1327,6 +1543,11 @@ func (m *model) detailContent() string {
 			return "Diff is available after the run finishes."
 		}
 		return "No diff."
+	case viewTests:
+		if record := m.selectedTaskRecord(); record != nil {
+			return validationViewWidth(m.runSnapshot(*record), m.detail.Width)
+		}
+		return "No validation yet."
 	case viewTrace:
 		return "Trajectory\n\n" + m.trajectoryPath()
 	default:
@@ -1339,15 +1560,15 @@ func (m *model) detailContent() string {
 			}
 			return "No task history yet."
 		}
-		chat := m.selectedChat()
-		if m.selected >= 0 && m.selected < len(chat) {
-			return chatDetailWidth(chat[m.selected], m.detail.Width)
+		steps := m.selectedSteps()
+		if m.selected >= 0 && m.selected < len(steps) {
+			return stepDetailWidth(steps[m.selected], m.detail.Width)
 		}
 		if record := m.selectedTaskRecord(); record != nil {
-			return taskDetailWidth(*record, m.detail.Width)
+			return finalReviewWidth(m.runSnapshot(*record), m.detail.Width)
 		}
 		if m.loop && !m.running {
-			return "Type a task below to start.\n\nSlash commands: /history, /clear, /quit, /help, /trace, /open-trace."
+			return "Type a task below to start.\n\nSlash commands: /history, /clear, /quit, /help, /diff, /trace, /open-trace."
 		}
 		return "Waiting for events..."
 	}
@@ -1378,30 +1599,26 @@ func (m *model) View() string {
 		parts = append(parts, m.approvalView(m.width-2))
 	}
 	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
-		parts = append(parts, inputStyle.Width(m.width-2).Render(m.command.View()))
+		parts = append(parts, m.inputView())
 	}
 	parts = append(parts, m.footerView())
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 func (m *model) headerView() string {
-	state := "idle"
-	if m.running {
-		state = "running"
-	} else if m.done {
-		state = "done"
-	}
-	if m.mode == modeApproval {
-		state = "approval"
-	}
 	elapsed := time.Since(m.startedAt).Round(time.Second)
 	taskLabel := fmt.Sprintf("task %d/%d", max(0, m.selectedTask+1), len(m.tasks))
-	title := fmt.Sprintf(" swe-agent  %s %s  %s  chat %d  %s  %s ",
-		m.spinner.View(), state, taskLabel, len(m.selectedChat()), m.modelLabel(), elapsed)
-	if m.done {
-		title = fmt.Sprintf(" swe-agent  %s  %s  steps %d  %s ", m.result.Status, taskLabel, m.result.Steps, elapsed)
+	indicator := " "
+	if m.running {
+		indicator = m.spinner.View()
 	}
-	return headerStyle.Width(m.width).Render(truncate(title, m.width))
+	left := fmt.Sprintf(" swe-agent  %s %s  %s ", indicator, m.phaseLabel(), taskLabel)
+	right := fmt.Sprintf(" %s  %s  %s ", m.profileLabel(), m.modelLabel(), elapsed)
+	if m.done {
+		right = fmt.Sprintf(" %s  steps %d  %s ", m.profileLabel(), m.result.Steps, elapsed)
+	}
+	header := headerStyle.Width(m.width).Render(fillLine(left, right, m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, header, artifactBarStyle.Width(m.width).Render(m.artifactBar()))
 }
 
 func (m *model) modelLabel() string {
@@ -1417,6 +1634,54 @@ func (m *model) modelLabel() string {
 		return ""
 	}
 	return provider + ":default"
+}
+
+func (m *model) profileLabel() string {
+	if m.agent == nil {
+		return "profile:default"
+	}
+	profile := strings.TrimSpace(m.agent.Config.Model.Profile)
+	if profile == "" {
+		profile = strings.TrimSpace(m.agent.Config.Agent.ActionMode)
+	}
+	if profile == "" {
+		profile = "default"
+	}
+	policy := "manual"
+	if m.agent.Config.Policy.AutoApproveRead && m.agent.Config.Policy.AutoApproveWrite && m.agent.Config.Policy.AutoApproveExec {
+		policy = "auto"
+	} else if m.agent.Config.Policy.AutoApproveRead {
+		policy = "safe"
+	}
+	return profile + "/" + policy
+}
+
+func (m *model) artifactBar() string {
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return " Files 0   Diff none   Tests 0/0   Approvals 0   Trace no "
+	}
+	snapshot := m.runSnapshot(*record)
+	diffState := "none"
+	if snapshot.FinalReview.ChangedFiles > 0 || record.Result.Diff != "" {
+		diffState = "available"
+	}
+	traceState := "no"
+	if snapshot.FinalReview.Trajectory != "" {
+		traceState = "yes"
+	}
+	approvals := 0
+	if m.approval != nil {
+		approvals = 1
+	}
+	return fmt.Sprintf(" Files %d   Diff %s   Tests %d/%d   Approvals %d   Trace %s ",
+		snapshot.FinalReview.ChangedFiles,
+		diffState,
+		snapshot.FinalReview.TestsPassed,
+		snapshot.FinalReview.TestsRun,
+		approvals,
+		traceState,
+	)
 }
 
 func (m *model) bodyView() string {
@@ -1437,6 +1702,24 @@ func (m *model) bodyView() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, detail)
 }
 
+func (m *model) inputView() string {
+	prompt := "Message"
+	switch m.mode {
+	case modeCommand:
+		prompt = "Command"
+	case modeSearch:
+		prompt = "Search"
+	case modeTask:
+		prompt = "Task"
+	}
+	line := lipgloss.JoinHorizontal(lipgloss.Top,
+		inputLabelStyle.Render(" "+prompt+" "),
+		" ",
+		m.command.View(),
+	)
+	return inputBoxStyle.Width(m.width - 2).Render(line)
+}
+
 func (m *model) sidebarView(width, height int) string {
 	if m.sidebar == sidebarHistory {
 		return m.historyView(width, height)
@@ -1445,20 +1728,20 @@ func (m *model) sidebarView(width, height int) string {
 }
 
 func (m *model) chatView(width, height int) string {
-	title := "Chat"
+	title := "Mission / Steps"
 	if record := m.selectedTaskRecord(); record != nil {
-		title = fmt.Sprintf("Task #%d chat", record.ID)
+		title = fmt.Sprintf("Task #%d steps", record.ID)
 	}
 	if height <= 0 {
 		return ""
 	}
 	lines := []string{sidebarTitleStyle.Render(truncate(title, width))}
 	listHeight := max(0, height-1)
-	chat := m.selectedChat()
-	if len(chat) == 0 {
-		message := "Waiting for agent summary..."
+	steps := m.selectedSteps()
+	if len(steps) == 0 {
+		message := "Waiting for agent activity..."
 		if m.loop && !m.running {
-			message = "No active task. Enter a task below."
+			message = "Enter a task below."
 		}
 		lines = append(lines, mutedStyle.Render(truncate(message, width)))
 		for len(lines) < height {
@@ -1466,7 +1749,7 @@ func (m *model) chatView(width, height int) string {
 		}
 		return strings.Join(lines, "\n")
 	}
-	end := min(len(chat), m.chatOffset+listHeight)
+	end := min(len(steps), m.chatOffset+listHeight)
 	for i := m.chatOffset; i < end; i++ {
 		prefix := "  "
 		style := sidebarItemStyle
@@ -1474,7 +1757,7 @@ func (m *model) chatView(width, height int) string {
 			prefix = "> "
 			style = selectedStyle
 		}
-		lines = append(lines, style.Render(truncate(prefix+chatLine(chat[i]), width)))
+		lines = append(lines, style.Render(truncate(prefix+stepLine(steps[i]), width)))
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
@@ -1531,12 +1814,11 @@ func (m *model) footerView() string {
 	if m.mode == modeQuitConfirm {
 		return footerStyle.Width(m.width).Render("confirm cancel: q/y/enter cancel | esc/n continue")
 	}
-	if m.status != "" {
-		status := truncate(m.status, max(10, m.width/2))
-		helpText := m.help.ShortHelpView(m.shortHelp())
-		return footerStyle.Width(m.width).Render(lipgloss.JoinHorizontal(lipgloss.Top, statusStyle.Render(status), "  ", helpText))
-	}
-	return footerStyle.Width(m.width).Render(m.help.ShortHelpView(m.shortHelp()))
+	shortcuts := m.help.ShortHelpView(m.shortHelp())
+	status := valueOrDefault(m.status, m.statusHint())
+	left := fmt.Sprintf(" %s: %s", m.phaseLabel(), status)
+	left = truncate(left, max(10, m.width-len(shortcuts)-4))
+	return footerStyle.Width(m.width).Render(fillLine(left, shortcuts+" ", m.width))
 }
 
 func (m *model) helpView() string {
@@ -1568,7 +1850,7 @@ func (m *model) fullHelp() [][]key.Binding {
 		{keyMove, keyLeftRight, keyTop, keyBottom, keyCenter},
 		{keyScrollHalf, keyScrollPage, keyTab, keyOpen},
 		{keySearch, keyNext, keyPrev, keyCommand, keyHelp},
-		{keyDiff, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
+		{keyDiff, keyTests, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
 		{keyTaskInput, keySlashHistory, keySlashClear, keySlashQuit},
 		{keyAllow, keyDeny, keyRemember, keyExpandApproval},
 		{keyQuit, keyCancel},
@@ -1666,15 +1948,36 @@ func eventDetailWidth(event core.Event, width int) string {
 }
 
 func chatLine(entry chatEntry) string {
-	role := valueOrDefault(entry.Title, valueOrDefault(entry.Role, "Message"))
+	role := chatRoleLabel(entry)
 	body := shortString(entry.Body, 56)
 	if body == "" {
 		body = "(empty)"
 	}
 	if entry.Time.IsZero() {
-		return fmt.Sprintf("%-10s %s", role, body)
+		return fmt.Sprintf("%-8s %s", role, body)
 	}
-	return fmt.Sprintf("%s %-10s %s", entry.Time.Format("15:04:05"), role, body)
+	return fmt.Sprintf("%s %-8s %s", entry.Time.Format("15:04:05"), role, body)
+}
+
+func chatRoleLabel(entry chatEntry) string {
+	switch strings.ToLower(strings.TrimSpace(entry.Role)) {
+	case "user":
+		return "User"
+	case "assistant":
+		return "Agent"
+	case "tool":
+		return "Tool"
+	case "result":
+		return "Result"
+	case "denied":
+		return "Denied"
+	case "error":
+		return "Error"
+	case "summary":
+		return "Summary"
+	default:
+		return valueOrDefault(entry.Title, valueOrDefault(entry.Role, "Message"))
+	}
 }
 
 func chatDetailWidth(entry chatEntry, width int) string {
@@ -1884,6 +2187,124 @@ func taskDetailWidth(record taskRecord, width int) string {
 	return b.String()
 }
 
+func stepLine(step StepCard) string {
+	command := shortString(step.Command, 36)
+	if command == "" {
+		command = shortString(step.Tool, 36)
+	}
+	duration := ""
+	if step.Duration > 0 {
+		duration = " " + step.Duration.String()
+	}
+	return fmt.Sprintf("Step %-2d %-9s %-10s %-8s%s", step.Index, step.Phase, command, step.Outcome, duration)
+}
+
+func stepDetailWidth(step StepCard, width int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Step %d\n", step.Index)
+	writeField(&b, "Phase", step.Phase, width)
+	writeField(&b, "Tool", step.Tool, width)
+	writeField(&b, "Outcome", step.Outcome, width)
+	if step.Command != "" {
+		writeField(&b, "Command", step.Command, width)
+	}
+	if !step.Started.IsZero() {
+		writeField(&b, "Started", step.Started.Format(time.RFC3339), width)
+	}
+	if step.Duration > 0 {
+		writeField(&b, "Duration", step.Duration.String(), width)
+	}
+	if len(step.EventIDs) > 0 {
+		writeField(&b, "Events", formatEventIDs(step.EventIDs), width)
+	}
+	if step.Why != "" {
+		writeSection(&b, "Why")
+		b.WriteString(wrapText(step.Why, width))
+		b.WriteByte('\n')
+	}
+	if step.Action != "" {
+		writeSection(&b, "Action")
+		b.WriteString(wrapText(step.Action, width))
+		b.WriteByte('\n')
+	}
+	if step.Output != "" {
+		writeSection(&b, "Observation")
+		b.WriteString(wrapText(step.Output, width))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func finalReviewWidth(snapshot RunSnapshot, width int) string {
+	var b strings.Builder
+	b.WriteString("Final Review\n")
+	writeField(&b, "Goal", snapshot.Task.Text, width)
+	writeField(&b, "Repository", snapshot.Task.Repo, width)
+	writeField(&b, "Status", snapshot.FinalReview.Status, width)
+	writeField(&b, "Steps", snapshot.FinalReview.Steps, width)
+	writeField(&b, "Changed Files", snapshot.FinalReview.ChangedFiles, width)
+	writeField(&b, "Validation", fmt.Sprintf("%d/%d passed", snapshot.FinalReview.TestsPassed, snapshot.FinalReview.TestsRun), width)
+	writeField(&b, "Trajectory", snapshot.FinalReview.Trajectory, width)
+	if snapshot.FinalReview.Submission != "" {
+		writeSection(&b, "Submission")
+		b.WriteString(wrapText(snapshot.FinalReview.Submission, width))
+		b.WriteByte('\n')
+	}
+	for _, artifact := range snapshot.Artifacts {
+		if artifact.Kind != "error" || strings.TrimSpace(artifact.Body) == "" {
+			continue
+		}
+		writeSection(&b, "Error")
+		b.WriteString(wrapText(artifact.Body, width))
+		b.WriteByte('\n')
+		break
+	}
+	writeSection(&b, "Actions")
+	for _, action := range []string{
+		"d inspect diff",
+		":trace inspect trajectory path",
+		"i new task",
+		"q quit",
+	} {
+		b.WriteString("  ")
+		b.WriteString(action)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func validationViewWidth(snapshot RunSnapshot, width int) string {
+	var b strings.Builder
+	b.WriteString("Validation\n")
+	found := false
+	for _, step := range snapshot.Steps {
+		if step.Phase != "validate" && step.Tool != "run_tests" {
+			continue
+		}
+		found = true
+		writeSection(&b, valueOrDefault(step.Command, step.Tool))
+		writeField(&b, "Status", step.Outcome, width)
+		if step.Duration > 0 {
+			writeField(&b, "Duration", step.Duration.String(), width)
+		}
+		if step.Output != "" {
+			writeField(&b, "Evidence", step.Output, width)
+		}
+	}
+	if !found {
+		b.WriteString("\nNo validation command recorded.\n")
+	}
+	return b.String()
+}
+
+func formatEventIDs(ids []int) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("#%d", id+1))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func approvalDetail(state *approvalState) string {
 	req := state.msg.request
 	var b strings.Builder
@@ -1903,6 +2324,15 @@ func formatArgs(args map[string]any) string {
 	var b strings.Builder
 	writeValueTree(&b, "", args, 0, 0)
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func formatArgsMap(value any) string {
+	normalized := normalizeValue(value)
+	args, ok := normalized.(map[string]any)
+	if !ok {
+		return strings.TrimSpace(formatScalar(normalized))
+	}
+	return formatArgs(args)
 }
 
 func writeSection(b *strings.Builder, title string) {
@@ -2204,6 +2634,18 @@ func truncate(s string, limit int) string {
 	return string(runes[:limit-3]) + "..."
 }
 
+func fillLine(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftRunes := []rune(left)
+	rightRunes := []rune(right)
+	if len(leftRunes)+len(rightRunes) >= width {
+		return truncate(left+right, width)
+	}
+	return left + strings.Repeat(" ", width-len(leftRunes)-len(rightRunes)) + right
+}
+
 func clamp(v, low, high int) int {
 	if high < low {
 		return low
@@ -2244,18 +2686,24 @@ var (
 	colorAccent = lipgloss.Color("39")
 	colorBorder = lipgloss.Color("238")
 	colorMuted  = lipgloss.Color("244")
+	colorPanel  = lipgloss.Color("236")
 
 	headerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("24")).
+			Background(lipgloss.Color("237")).
 			Bold(true)
+	artifactBarStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250")).
+				Background(lipgloss.Color("235"))
 	panelStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
+			BorderForeground(colorPanel).
 			Padding(0, 1)
 	footerStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
 	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("250"))
+			Foreground(lipgloss.Color("250")).
+			Background(lipgloss.Color("235"))
 	mutedStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
 	sidebarTitleStyle = lipgloss.NewStyle().
@@ -2265,11 +2713,20 @@ var (
 				Foreground(lipgloss.Color("252"))
 	selectedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("31"))
+			Background(lipgloss.Color("24")).
+			Bold(true)
 	approvalStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("214")).
 			Padding(0, 1)
+	inputBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(colorAccent).
+			Padding(0, 1)
+	inputLabelStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("15")).
+			Background(lipgloss.Color("24")).
+			Bold(true)
 	inputStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
 )
@@ -2291,7 +2748,8 @@ var (
 	keyCommand        = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
 	keyHelp           = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
 	keyDiff           = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
-	keyTimeline       = key.NewBinding(key.WithKeys("t", ":chat", ":timeline"), key.WithHelp("t", "chat"))
+	keyTests          = key.NewBinding(key.WithKeys(":tests"), key.WithHelp(":tests", "validation"))
+	keyTimeline       = key.NewBinding(key.WithKeys("t", ":timeline"), key.WithHelp("t", "steps"))
 	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
 	keyTrace          = key.NewBinding(key.WithKeys(":trace"), key.WithHelp(":trace", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
