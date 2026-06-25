@@ -227,28 +227,60 @@ func mergeDirection(old, next InvestigationDirection) InvestigationDirection {
 }
 
 func addEvidence(trace *ProblemTrace, directionID string, evidence Evidence, eventID int) {
+	if evidence.Relation == "" {
+		evidence.Relation = EvidenceSupports
+	}
 	evidence.EventIDs = appendIfMissing(evidence.EventIDs, eventID)
 	for i := range trace.Directions {
 		if trace.Directions[i].ID != directionID {
 			continue
 		}
-		for _, existing := range trace.Directions[i].SupportingEvidence {
-			if existing.ID == evidence.ID {
-				return
+		if hasEvidence(trace.Directions[i], evidence.ID) {
+			return
+		}
+		switch evidence.Relation {
+		case EvidenceRefutes:
+			trace.Directions[i].RefutingEvidence = append(trace.Directions[i].RefutingEvidence, evidence)
+			if trace.Directions[i].Status != DirectionFixed {
+				trace.Directions[i].Status = DirectionRefuted
+			}
+		default:
+			trace.Directions[i].SupportingEvidence = append(trace.Directions[i].SupportingEvidence, evidence)
+			if trace.Directions[i].Status == DirectionOpen || trace.Directions[i].Status == DirectionActive {
+				trace.Directions[i].Status = DirectionSupported
 			}
 		}
-		trace.Directions[i].SupportingEvidence = append(trace.Directions[i].SupportingEvidence, evidence)
 		return
 	}
 	if directionID == "" {
 		directionID = "dir-observation"
 	}
-	trace.Directions = append(trace.Directions, InvestigationDirection{
-		ID:                 directionID,
-		Hypothesis:         "Interpret captured evidence",
-		Status:             DirectionSupported,
-		SupportingEvidence: []Evidence{evidence},
-	})
+	direction := InvestigationDirection{
+		ID:         directionID,
+		Hypothesis: "Interpret captured evidence",
+		Status:     DirectionSupported,
+	}
+	if evidence.Relation == EvidenceRefutes {
+		direction.Status = DirectionRefuted
+		direction.RefutingEvidence = []Evidence{evidence}
+	} else {
+		direction.SupportingEvidence = []Evidence{evidence}
+	}
+	trace.Directions = append(trace.Directions, direction)
+}
+
+func hasEvidence(direction InvestigationDirection, evidenceID string) bool {
+	for _, existing := range direction.SupportingEvidence {
+		if existing.ID == evidenceID {
+			return true
+		}
+	}
+	for _, existing := range direction.RefutingEvidence {
+		if existing.ID == evidenceID {
+			return true
+		}
+	}
+	return false
 }
 
 func hasPrompt(trace ProblemTrace, id string) bool {

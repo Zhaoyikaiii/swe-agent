@@ -69,13 +69,23 @@ type InvestigationDirection struct {
 	ToolEventIDs       []int           `json:"tool_event_ids,omitempty"`
 }
 
+type EvidenceRelation string
+
+const (
+	EvidenceSupports EvidenceRelation = "supports"
+	EvidenceRefutes  EvidenceRelation = "refutes"
+	EvidenceNeutral  EvidenceRelation = "neutral"
+)
+
 type Evidence struct {
-	ID        string    `json:"id"`
-	Summary   string    `json:"summary"`
-	Detail    string    `json:"detail,omitempty"`
-	Source    string    `json:"source,omitempty"`
-	EventIDs  []int     `json:"event_ids,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
+	ID           string           `json:"id"`
+	Summary      string           `json:"summary"`
+	Detail       string           `json:"detail,omitempty"`
+	Relation     EvidenceRelation `json:"relation,omitempty"`
+	Source       string           `json:"source,omitempty"`
+	SourceSpanID string           `json:"source_span_id,omitempty"`
+	EventIDs     []int            `json:"event_ids,omitempty"`
+	CreatedAt    time.Time        `json:"created_at,omitempty"`
 }
 
 type NextAction struct {

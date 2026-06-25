@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -152,12 +155,14 @@ func (a *Agent) Step(ctx context.Context, state *State) error {
 		a.appendEvents(ctx, events)
 	}
 	requestData := map[string]any{
-		"step":            state.Steps,
-		"messages":        len(req.Messages),
-		"prompt_snapshot": buildPromptSnapshot(req),
+		"step":     state.Steps,
+		"messages": len(req.Messages),
 	}
 	if promptSnapshot.ID != "" {
 		requestData["prompt_snapshot_id"] = promptSnapshot.ID
+		requestData["prompt_snapshot"] = promptSnapshot
+	} else {
+		requestData["prompt_snapshot"] = buildPromptSnapshot(req)
 	}
 	if modelContext.TraceID != "" {
 		requestData["trace_context"] = modelContext
@@ -239,7 +244,7 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		return fmt.Errorf("execute tool %s: %w", call.Name, err)
 	}
 	result = a.Policy.FilterObservation(ctx, result)
-	resultData := map[string]any{"tool": call.Name, "code": result.Code, "timed_out": result.TimedOut, "output": result.Output}
+	resultData := buildToolResultEventData(call, result)
 	if toolContext.TraceID != "" {
 		resultData["trace_context"] = toolContext
 	}
@@ -310,8 +315,6 @@ func buildPromptSnapshot(req core.ModelRequest) map[string]any {
 		promptBlock("Recent Observations", countMessages(req.Messages, core.RoleTool), "tool observations from this run"),
 		promptBlock("Conversation State", countMessages(req.Messages, core.RoleAssistant), "visible assistant responses from this run"),
 		promptBlock("Tool Schema", len(req.Tools), "available tool names and schemas"),
-		promptBlock("Investigation Frontier", 0, "not yet injected by the agent loop"),
-		promptBlock("Memory Context", 0, "not yet injected by the agent loop"),
 	}
 	return map[string]any{
 		"working_dir":     req.WorkingDir,
@@ -323,6 +326,57 @@ func buildPromptSnapshot(req core.ModelRequest) map[string]any {
 		"blocks":          blocks,
 		"message_summary": summarizePromptMessages(req.Messages),
 	}
+}
+
+const traceOutputPreviewLimit = 1600
+
+func buildToolResultEventData(call core.ToolCall, result core.ToolResult) map[string]any {
+	redacted := redactTraceOutput(result.Output)
+	preview, truncated := truncateRunes(redacted, traceOutputPreviewLimit)
+	data := map[string]any{
+		"tool":             call.Name,
+		"code":             result.Code,
+		"timed_out":        result.TimedOut,
+		"output_preview":   preview,
+		"output_hash":      hashTraceOutput(result.Output),
+		"output_chars":     len([]rune(result.Output)),
+		"output_truncated": truncated,
+	}
+	if redacted != result.Output {
+		data["output_redacted"] = true
+	}
+	if len(result.Artifacts) > 0 {
+		data["artifacts"] = result.Artifacts
+	}
+	if len(result.Metadata) > 0 {
+		data["metadata"] = result.Metadata
+	}
+	return data
+}
+
+func truncateRunes(value string, limit int) (string, bool) {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value, false
+	}
+	if limit <= 3 {
+		return string(runes[:limit]), true
+	}
+	return string(runes[:limit-3]) + "...", true
+}
+
+func hashTraceOutput(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func redactTraceOutput(value string) string {
+	out := value
+	assignment := regexp.MustCompile(`(?i)(OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|SECRET|TOKEN|PASSWORD)=([^\s]+)`)
+	privateKey := regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`)
+	out = assignment.ReplaceAllString(out, "$1=[REDACTED]")
+	out = privateKey.ReplaceAllString(out, "[REDACTED PRIVATE KEY]")
+	return out
 }
 
 func promptBlock(name string, count int, summary string) map[string]any {

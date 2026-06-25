@@ -320,7 +320,7 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Trace History",
 		"* Problem (Go compile failed with import cycle not allowed: go test ./...)",
 		"! Go compile failed with import cycle not allowed: go test ./... (observed)",
-		"> Resolve the Go import cycle (active)",
+		"D Resolve the Go import cycle (supported)",
 		"+ package service imports handler and handler imports service (supports)",
 		"P Prompt snapshot 1 (captured)",
 		"Span Graph",

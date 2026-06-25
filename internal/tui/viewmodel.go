@@ -146,7 +146,7 @@ func BuildRunSnapshot(record taskRecord, trajectoryPath string) RunSnapshot {
 			step := &snapshot.Steps[stepIndex]
 			step.EventIDs = append(step.EventIDs, i)
 			step.Outcome = outcomeFromResult(event)
-			step.Output = strings.TrimSpace(fmt.Sprint(event.Data["output"]))
+			step.Output = eventOutput(event.Data)
 			if !step.Started.IsZero() && !event.Time.IsZero() && event.Time.After(step.Started) {
 				step.Duration = event.Time.Sub(step.Started).Round(time.Second)
 			}
@@ -193,6 +193,19 @@ func BuildRunSnapshot(record taskRecord, trajectoryPath string) RunSnapshot {
 		Submission:   taskConclusion(record),
 	}
 	return snapshot
+}
+
+func eventOutput(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	if preview, ok := data["output_preview"]; ok {
+		return strings.TrimSpace(fmt.Sprint(preview))
+	}
+	if output, ok := data["output"]; ok {
+		return strings.TrimSpace(fmt.Sprint(output))
+	}
+	return ""
 }
 
 func BuildTimeline(record taskRecord, snapshot RunSnapshot) []TimelineItem {

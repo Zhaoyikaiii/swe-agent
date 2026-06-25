@@ -60,6 +60,7 @@ func (m *Manager) StartRun(ctx context.Context, task core.Task, resource TraceRe
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.resetRunLocked()
 	now := time.Now()
 	traceID := newID("trace", now, task.Text+"|"+task.Repo)
 	m.runSpanID = "span-1"
@@ -123,6 +124,20 @@ func (m *Manager) StartRun(ctx context.Context, task core.Task, resource TraceRe
 	}
 }
 
+func (m *Manager) resetRunLocked() {
+	m.trace = ProblemTrace{}
+	m.spanSeq = 0
+	m.symptomSeq = 0
+	m.directionSeq = 0
+	m.evidenceSeq = 0
+	m.promptSeq = 0
+	m.cardSeq = 0
+	m.runSpanID = ""
+	m.lastModelSpanID = ""
+	m.patchApplied = false
+	m.verificationOK = false
+}
+
 func (m *Manager) BuildPrompt(ctx context.Context, input PromptInput) PromptResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -145,9 +160,7 @@ func (m *Manager) BuildPrompt(ctx context.Context, input PromptInput) PromptResu
 	messages := append([]core.Message(nil), input.Messages...)
 	contextBlock := m.renderPromptContextLocked()
 	if strings.TrimSpace(contextBlock) != "" {
-		messages = append(messages, core.Message{Role: core.RoleSystem, Content: contextBlock, Extra: map[string]string{
-			"problem_trace": "frontier",
-		}})
+		messages = injectTraceContext(messages, contextBlock)
 	}
 	snapshot := PromptSnapshot{
 		ID:            promptID,
@@ -202,6 +215,32 @@ func (m *Manager) BuildPrompt(ctx context.Context, input PromptInput) PromptResu
 			}),
 		},
 	}
+}
+
+func injectTraceContext(messages []core.Message, contextBlock string) []core.Message {
+	contextBlock = strings.TrimSpace(contextBlock)
+	if contextBlock == "" {
+		return messages
+	}
+	if len(messages) > 0 && messages[0].Role == core.RoleSystem {
+		messages[0].Content = strings.TrimSpace(messages[0].Content) + "\n\n" + contextBlock
+		if len(messages[0].Extra) > 0 {
+			extra := make(map[string]string, len(messages[0].Extra)+1)
+			for k, v := range messages[0].Extra {
+				extra[k] = v
+			}
+			extra["problem_trace"] = "frontier"
+			messages[0].Extra = extra
+		} else {
+			messages[0].Extra = map[string]string{"problem_trace": "frontier"}
+		}
+		return messages
+	}
+	return append([]core.Message{{
+		Role:    core.RoleSystem,
+		Content: contextBlock,
+		Extra:   map[string]string{"problem_trace": "frontier"},
+	}}, messages...)
 }
 
 func (m *Manager) StartModelCall(ctx context.Context, step int, promptID string, provider string, model string) (TraceContext, []core.Event) {
@@ -422,7 +461,7 @@ func (m *Manager) applyToolObservationLocked(tc TraceContext, call core.ToolCall
 	if call.Name == "apply_patch" && result.Code == 0 {
 		m.patchApplied = true
 		directionID := m.ensureGenericDirectionLocked("Apply and review the candidate fix", "A patch was applied and now needs verification.", 60)
-		ev := m.addEvidenceLocked(directionID, "Patch applied successfully", "apply_patch exited successfully", "tool_result", []int{})
+		ev := m.addEvidenceLocked(directionID, "Patch applied successfully", "apply_patch exited successfully", EvidenceSupports, "tool_result", tc.SpanID, []int{})
 		changes.Evidence = append(changes.Evidence, DirectionEvidence{DirectionID: directionID, Evidence: ev})
 	}
 
@@ -443,7 +482,7 @@ func (m *Manager) applyToolObservationLocked(tc TraceContext, call core.ToolCall
 		direction := m.directionForSymptomLocked(symptom)
 		if direction != nil {
 			changes.Directions = append(changes.Directions, *direction)
-			ev := m.addEvidenceLocked(direction.ID, symptom.Summary, symptom.RawExcerpt, "tool_result", symptom.EventIDs)
+			ev := m.addEvidenceLocked(direction.ID, symptom.Summary, symptom.RawExcerpt, EvidenceSupports, "tool_result", tc.SpanID, symptom.EventIDs)
 			changes.Evidence = append(changes.Evidence, DirectionEvidence{DirectionID: direction.ID, Evidence: ev})
 			if spanID := tc.SpanID; spanID != "" {
 				m.linkLocked(spanID, direction.ID, LinkSupports, map[string]any{
@@ -455,23 +494,29 @@ func (m *Manager) applyToolObservationLocked(tc TraceContext, call core.ToolCall
 	}
 
 	if len(symptoms) == 0 && isValidationCommand(call.Name, command) && result.Code == 0 {
-		m.verificationOK = true
-		if m.trace.Frontier.ActiveDirectionID != "" {
+		if m.trace.Frontier.ActiveDirectionID != "" && validationMatchesRepro(m.trace, command) {
 			idx := m.directionIndexLocked(m.trace.Frontier.ActiveDirectionID)
 			if idx >= 0 {
-				m.trace.Directions[idx].Status = DirectionFixed
-				ev := m.addEvidenceLocked(m.trace.Directions[idx].ID, "Verification passed", valueOr(command, call.Name)+" exited successfully", "tool_result", nil)
+				summary := "Validation no longer reproduces the active symptom"
+				relation := EvidenceRefutes
+				if m.patchApplied {
+					m.verificationOK = true
+					summary = "Verification passed"
+					relation = EvidenceSupports
+					m.trace.Directions[idx].Status = DirectionFixed
+				}
+				ev := m.addEvidenceLocked(m.trace.Directions[idx].ID, summary, valueOr(command, call.Name)+" exited successfully", relation, "tool_result", tc.SpanID, nil)
 				changes.Evidence = append(changes.Evidence, DirectionEvidence{DirectionID: m.trace.Directions[idx].ID, Evidence: ev})
 			}
 		}
 	}
 
-	if len(symptoms) == 0 && call.Name != "submit" && strings.TrimSpace(output) != "" {
+	if len(symptoms) == 0 && call.Name != "submit" && strings.TrimSpace(output) != "" && !(isValidationCommand(call.Name, command) && result.Code == 0) {
 		directionID := m.trace.Frontier.ActiveDirectionID
 		if directionID == "" {
 			directionID = m.ensureGenericDirectionLocked("Collect current repository evidence", "A tool observation was captured and should be interpreted before patching.", 40)
 		}
-		ev := m.addEvidenceLocked(directionID, fmt.Sprintf("%s observation captured", call.Name), short(output, 360), "tool_result", nil)
+		ev := m.addEvidenceLocked(directionID, fmt.Sprintf("%s observation captured", call.Name), short(output, 360), EvidenceSupports, "tool_result", tc.SpanID, nil)
 		changes.Evidence = append(changes.Evidence, DirectionEvidence{DirectionID: directionID, Evidence: ev})
 	}
 
@@ -538,9 +583,7 @@ func (m *Manager) ensureDirectionLocked(id, hypothesis, rationale string, priori
 		direction.NextActions[i].DirectionID = id
 	}
 	if m.trace.Frontier.ActiveDirectionID != "" {
-		if idx := m.directionIndexLocked(m.trace.Frontier.ActiveDirectionID); idx >= 0 && m.trace.Directions[idx].Status == DirectionActive {
-			m.trace.Directions[idx].Status = DirectionSupported
-		}
+		m.deactivateDirectionLocked(m.trace.Frontier.ActiveDirectionID)
 	}
 	m.trace.Directions = append(m.trace.Directions, direction)
 	m.trace.Frontier.ActiveDirectionID = id
@@ -566,20 +609,43 @@ func (m *Manager) ensureGenericDirectionLocked(hypothesis, rationale string, pri
 	return id
 }
 
-func (m *Manager) addEvidenceLocked(directionID, summary, detail, source string, eventIDs []int) Evidence {
+func (m *Manager) deactivateDirectionLocked(directionID string) {
+	idx := m.directionIndexLocked(directionID)
+	if idx < 0 {
+		return
+	}
+	if m.trace.Directions[idx].Status == DirectionActive {
+		m.trace.Directions[idx].Status = DirectionOpen
+	}
+}
+
+func (m *Manager) addEvidenceLocked(directionID, summary, detail string, relation EvidenceRelation, source, sourceSpanID string, eventIDs []int) Evidence {
+	if relation == "" {
+		relation = EvidenceSupports
+	}
 	m.evidenceSeq++
 	ev := Evidence{
-		ID:        fmt.Sprintf("evidence-%d", m.evidenceSeq),
-		Summary:   summary,
-		Detail:    short(detail, excerptLimit),
-		Source:    source,
-		EventIDs:  append([]int(nil), eventIDs...),
-		CreatedAt: time.Now(),
+		ID:           fmt.Sprintf("evidence-%d", m.evidenceSeq),
+		Summary:      summary,
+		Detail:       short(detail, excerptLimit),
+		Relation:     relation,
+		Source:       source,
+		SourceSpanID: sourceSpanID,
+		EventIDs:     append([]int(nil), eventIDs...),
+		CreatedAt:    time.Now(),
 	}
 	if idx := m.directionIndexLocked(directionID); idx >= 0 {
-		m.trace.Directions[idx].SupportingEvidence = append(m.trace.Directions[idx].SupportingEvidence, ev)
-		if m.trace.Directions[idx].Status == DirectionOpen {
-			m.trace.Directions[idx].Status = DirectionSupported
+		switch relation {
+		case EvidenceRefutes:
+			m.trace.Directions[idx].RefutingEvidence = append(m.trace.Directions[idx].RefutingEvidence, ev)
+			if m.trace.Directions[idx].Status != DirectionFixed {
+				m.trace.Directions[idx].Status = DirectionRefuted
+			}
+		default:
+			m.trace.Directions[idx].SupportingEvidence = append(m.trace.Directions[idx].SupportingEvidence, ev)
+			if m.trace.Directions[idx].Status == DirectionOpen || m.trace.Directions[idx].Status == DirectionActive {
+				m.trace.Directions[idx].Status = DirectionSupported
+			}
 		}
 	}
 	m.trace.History = append(m.trace.History, TraceNode{
@@ -588,7 +654,7 @@ func (m *Manager) addEvidenceLocked(directionID, summary, detail, source string,
 		Kind:        "evidence",
 		Title:       summary,
 		Summary:     short(detail, 240),
-		Status:      "ok",
+		Status:      string(relation),
 		EventIDs:    append([]int(nil), eventIDs...),
 		DirectionID: directionID,
 		Time:        ev.CreatedAt,
@@ -599,7 +665,13 @@ func (m *Manager) addEvidenceLocked(directionID, summary, detail, source string,
 func (m *Manager) updateFrontierLocked() {
 	var candidates []string
 	var recommended []NextAction
-	active := m.trace.Frontier.ActiveDirectionID
+	active := ""
+	if idx := m.directionIndexLocked(m.trace.Frontier.ActiveDirectionID); idx >= 0 {
+		switch m.trace.Directions[idx].Status {
+		case DirectionOpen, DirectionActive, DirectionSupported:
+			active = m.trace.Frontier.ActiveDirectionID
+		}
+	}
 	for _, direction := range m.trace.Directions {
 		switch direction.Status {
 		case DirectionOpen, DirectionActive, DirectionSupported:
@@ -944,6 +1016,19 @@ func commandFromToolCall(call core.ToolCall) string {
 
 func isValidationCommand(tool, command string) bool {
 	return tool == "run_tests" || looksLikeTestCommand(command)
+}
+
+func validationMatchesRepro(trace ProblemTrace, command string) bool {
+	command = strings.TrimSpace(command)
+	if len(trace.Problem.ReproCommands) == 0 {
+		return command == ""
+	}
+	for _, repro := range trace.Problem.ReproCommands {
+		if strings.TrimSpace(repro) == command {
+			return true
+		}
+	}
+	return false
 }
 
 func looksLikeTestCommand(command string) bool {

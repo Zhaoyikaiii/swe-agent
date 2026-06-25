@@ -2259,7 +2259,7 @@ func eventDetailWidth(event core.Event, width int) string {
 		writeField(&b, "Tool", event.Data["tool"], width)
 		writeField(&b, "Code", event.Data["code"], width)
 		writeField(&b, "Timed Out", event.Data["timed_out"], width)
-		writeField(&b, "Output", event.Data["output"], width)
+		writeField(&b, "Output", eventOutput(event.Data), width)
 	case "tool_denied":
 		writeSection(&b, "Denied Tool")
 		writeField(&b, "Tool", event.Data["tool"], width)
