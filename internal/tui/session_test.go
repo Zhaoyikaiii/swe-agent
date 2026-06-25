@@ -325,7 +325,7 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Task: fix go test import cycle",
 		"Current Symptom: Go compile failed with import cycle not allowed: go test ./...",
 		"Trace Tree",
-		"> [-] . Problem  problem  Go compile failed with import cycle not allowed: go test ./...",
+		"> [-] * Problem  problem  running",
 		"+-- [ ] + Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
 		"+-- [-] + Resolve the Go import cycle  direction  supported",
 		"|   `-- [ ] + package service imports handler and handler imports service  evidence  supports",
@@ -491,6 +491,55 @@ func mockImportCycleProblemTraceEvents() []core.Event {
 		{Type: "evidence_added", Data: map[string]any{"trace_context": traceContext, "direction_id": direction.ID, "evidence": evidence}},
 		{Type: "frontier_updated", Data: map[string]any{"trace_context": traceContext, "frontier": frontier}},
 	}
+}
+
+func scrollableTraceWorkspaceEvents() []core.Event {
+	events := []core.Event{
+		{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}},
+	}
+	for i := 0; i < 30; i++ {
+		events = append(events, core.Event{
+			Type: "tool_call",
+			Data: map[string]any{
+				"tool": "shell",
+				"args": map[string]any{"command": fmt.Sprintf("echo step-%02d", i)},
+			},
+		})
+	}
+	for i := 0; i < 12; i++ {
+		events = append(events, core.Event{
+			Type: "prompt_snapshot",
+			Data: map[string]any{"snapshot": problemtrace.PromptSnapshot{
+				ID:            fmt.Sprintf("prompt-%02d", i),
+				Step:          i + 1,
+				Model:         "mock",
+				MessageCount:  3,
+				ToolCount:     1,
+				TokenEstimate: 100 + i,
+				Blocks: []problemtrace.PromptBlock{{
+					Kind:     "frontier",
+					Title:    "Investigation Frontier",
+					Included: true,
+					Count:    i + 1,
+					Summary:  fmt.Sprintf("follow-up trace context line %02d", i),
+				}},
+			}},
+		})
+	}
+	for i := 0; i < 12; i++ {
+		events = append(events, core.Event{
+			Type: "memory_card_generated",
+			Data: map[string]any{"card": problemtrace.MemoryCard{
+				ID:           fmt.Sprintf("card-%02d", i),
+				Kind:         "run_summary",
+				Status:       "draft",
+				Summary:      fmt.Sprintf("trace memory card summary %02d", i),
+				FixPattern:   "keep the failing path focused",
+				Verification: "rerun the focused command",
+			}},
+		})
+	}
+	return events
 }
 
 func TestModelLabelShowsProviderDefaultWhenModelIsEmpty(t *testing.T) {
@@ -738,6 +787,69 @@ func TestWideTraceUsesFullWidthWorkspace(t *testing.T) {
 	}
 	if footer := model.footerView(); !strings.Contains(footer, "trace tabs") {
 		t.Fatalf("expected trace-specific footer help, got:\n%s", footer)
+	}
+	if footer := model.footerView(); !strings.Contains(footer, "inspect") {
+		t.Fatalf("expected trace footer inspect help, got:\n%s", footer)
+	}
+}
+
+func TestTraceWorkspaceJKScrollsNonTreeTabs(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 12
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = scrollableTraceWorkspaceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+	model.setTraceTab("4")
+
+	before := model.detail.YOffset
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+
+	if model.detail.YOffset <= before {
+		t.Fatalf("expected j to scroll events tab, before=%d after=%d\n%s", before, model.detail.YOffset, model.detail.View())
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if model.detail.YOffset != before {
+		t.Fatalf("expected k to scroll events tab back to %d, got %d", before, model.detail.YOffset)
+	}
+}
+
+func TestTraceWorkspaceTabNavigationResetsViewport(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 12
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = scrollableTraceWorkspaceEvents()
+	model.setSelectedTask(taskIndex)
+
+	model.detail.YOffset = 4
+	model.openTraceWorkspace()
+	if model.detail.YOffset != 0 {
+		t.Fatalf("expected open trace workspace to reset viewport, got %d", model.detail.YOffset)
+	}
+
+	model.setTraceTab("5")
+	model.detail.LineDown(5)
+	if model.detail.YOffset == 0 {
+		t.Fatalf("test setup expected prompt tab to overflow:\n%s", model.detail.View())
+	}
+
+	model.cycleTraceTab(1)
+	if model.detail.YOffset != 0 {
+		t.Fatalf("expected cycleTraceTab to reset viewport, got %d", model.detail.YOffset)
+	}
+
+	model.setTraceTab("6")
+	model.detail.LineDown(5)
+	if model.detail.YOffset == 0 {
+		t.Fatalf("test setup expected cards tab to overflow:\n%s", model.detail.View())
+	}
+
+	model.setTraceTab("6")
+	if model.detail.YOffset != 0 {
+		t.Fatalf("expected setTraceTab to reset viewport, got %d", model.detail.YOffset)
 	}
 }
 

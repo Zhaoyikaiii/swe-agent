@@ -64,6 +64,7 @@ func traceTabLabel(tab traceTab) string {
 	}
 }
 
+// renderTraceSpanGraph is reserved for a future Spans tab.
 func renderTraceSpanGraph(b *strings.Builder, trace problemtrace.ProblemTrace, width int) {
 	writeSection(b, "Span Graph")
 	if len(trace.Spans) == 0 {

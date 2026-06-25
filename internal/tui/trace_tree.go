@@ -50,7 +50,7 @@ type TraceTreeRow struct {
 }
 
 var (
-	traceDefaultStyle   = lipgloss.NewStyle()
+	traceDefaultStyle   = lipgloss.NewStyle().Foreground(colorMuted)
 	traceProblemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	traceDirectionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
 	traceEvidenceStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
@@ -269,7 +269,11 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 			line += "  " + row.Status
 		}
 		line = truncate(line, width)
-		line = traceNodeLineStyle(row.Kind, row.Status, i == cursor).Render(line)
+		if i == cursor {
+			line = traceSelectedStyle.Width(width).Render(line)
+		} else {
+			line = traceNodeLineStyle(row.Kind, row.Status, false).Render(line)
+		}
 		b.WriteString(line)
 		b.WriteByte('\n')
 

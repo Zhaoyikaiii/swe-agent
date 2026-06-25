@@ -115,7 +115,7 @@ func buildHistory(trace *ProblemTrace, events []core.Event) {
 		Kind:    "problem",
 		Title:   "Problem",
 		Summary: short(trace.Problem.UserTask, 240),
-		Status:  valueOr(trace.Problem.ErrorSummary, "running"),
+		Status:  valueOr(traceStatusFromEvents(events), "running"),
 		Time:    trace.CreatedAt,
 	})
 	for _, symptom := range trace.Symptoms {
@@ -192,6 +192,19 @@ func buildHistory(trace *ProblemTrace, events []core.Event) {
 			Time:     last.Time,
 		})
 	}
+}
+
+func traceStatusFromEvents(events []core.Event) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type != "final" {
+			continue
+		}
+		status := strings.TrimSpace(fmt.Sprint(events[i].Data["status"]))
+		if status != "" && status != "<nil>" {
+			return status
+		}
+	}
+	return ""
 }
 
 func upsertSpan(trace *ProblemTrace, span TraceSpan) {

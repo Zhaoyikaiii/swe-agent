@@ -113,6 +113,33 @@ func TestManagerEmitsTraceNodeAddedEvents(t *testing.T) {
 	}
 }
 
+func TestFallbackRootStatusUsesFinalStatus(t *testing.T) {
+	trace := Replay([]core.Event{
+		{Type: "user_task", Data: map[string]any{"task": "fix tests", "repo": "/repo"}},
+		{Type: "problem_trace_initialized", Data: map[string]any{
+			"problem": ProblemContext{
+				UserTask:     "fix tests",
+				Repo:         "/repo",
+				ErrorSummary: "Go compile failed with import cycle not allowed: go test ./...",
+			},
+		}},
+		{Type: "final", Data: map[string]any{"status": "submitted"}},
+	})
+
+	if trace.Problem.ErrorSummary == "" {
+		t.Fatal("expected error summary to remain on problem context")
+	}
+	if len(trace.History) == 0 {
+		t.Fatal("expected fallback history")
+	}
+	if trace.History[0].Status != "submitted" {
+		t.Fatalf("expected root status from final event, got %q", trace.History[0].Status)
+	}
+	if strings.Contains(trace.History[0].Status, "import cycle") {
+		t.Fatalf("root status should not contain error summary: %q", trace.History[0].Status)
+	}
+}
+
 func TestManagerStartRunResetsPerRunState(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager()
