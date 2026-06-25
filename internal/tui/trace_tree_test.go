@@ -32,6 +32,26 @@ func TestTraceTreeBuildsParentChildRows(t *testing.T) {
 	}
 }
 
+func TestTraceTreeWeakensGenericObservationDirection(t *testing.T) {
+	nodes := []problemtrace.TraceNode{
+		{ID: "node-root", Kind: "problem", Title: "Problem", Status: "running"},
+		{ID: "node-dir-collect-current-repository-evidence", ParentID: "node-root", Kind: "direction", Title: "Collect current repository evidence", Status: "active"},
+	}
+
+	vm := buildTraceTreeVM(nodes)
+	rows := flattenTraceTree(vm, map[string]bool{
+		"node-root": true,
+	})
+	got := renderTraceTreeASCII(rows, traceWorkspaceState{Cursor: 1}, 100)
+
+	if !strings.Contains(got, "Observation captured") || !strings.Contains(got, "observation") {
+		t.Fatalf("expected generic direction to render as an observation, got:\n%s", got)
+	}
+	if strings.Contains(got, "Collect current repository evidence") {
+		t.Fatalf("expected generic direction title to be hidden, got:\n%s", got)
+	}
+}
+
 func TestTraceTreeCollapseHidesChildren(t *testing.T) {
 	nodes := []problemtrace.TraceNode{
 		{ID: "node-root", Kind: "problem", Title: "Problem"},

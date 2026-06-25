@@ -167,6 +167,7 @@ type traceWorkspaceState struct {
 	SelectedID string
 	Expanded   map[string]bool
 	FollowLive bool
+	Debug      bool
 }
 
 type sidebarMode int
@@ -487,6 +488,9 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		case "1", "2", "3", "4", "5", "6":
 			m.setTraceTab(keyString)
+			return nil
+		case "d":
+			m.toggleTraceDebug()
 			return nil
 		}
 		if m.traceView.Tab == traceTabTrace {
@@ -1515,6 +1519,17 @@ func (m *model) openTraceNode() {
 	m.updateDetail()
 }
 
+func (m *model) toggleTraceDebug() {
+	m.traceView.Debug = !m.traceView.Debug
+	if m.traceView.Debug {
+		m.status = "trace debug: on"
+	} else {
+		m.status = "trace debug: off"
+	}
+	m.detail.GotoTop()
+	m.updateDetail()
+}
+
 func (m *model) followTimelineBottom() {
 	if m.sidebar == sidebarRun && m.view == viewOverview {
 		m.detail.GotoBottom()
@@ -2278,7 +2293,7 @@ func overlayRows(base, popup string, width, height int) string {
 
 func (m *model) shortHelp() []key.Binding {
 	if m.view == viewTrace && m.mode == modeNormal {
-		return []key.Binding{keyTraceMove, keyTraceFold, keyTraceInspect, keyTraceTabs, keyEsc}
+		return []key.Binding{keyTraceMove, keyTraceFold, keyTraceInspect, keyTraceDebug, keyTraceTabs, keyEsc}
 	}
 
 	switch m.mode {
@@ -3420,6 +3435,7 @@ var (
 	keyTraceMove      = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "node"))
 	keyTraceFold      = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "fold"))
 	keyTraceInspect   = key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "inspect"))
+	keyTraceDebug     = key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "debug"))
 	keyTraceTabs      = key.NewBinding(key.WithKeys("tab", "1-6"), key.WithHelp("tab/1-6", "trace tabs"))
 	keySlashHelp      = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
 	keySlashHistory   = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))

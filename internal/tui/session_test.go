@@ -299,6 +299,75 @@ func TestTraceWorkspaceRendersPromptAndCards(t *testing.T) {
 	}
 }
 
+func TestTraceWorkspaceCompactTabsHideDebugDump(t *testing.T) {
+	record := taskRecord{
+		Task:   core.Task{Text: "fix go test import cycle", Repo: "/repo"},
+		Events: mockImportCycleProblemTraceEvents(),
+		Result: agentpkg.Result{TrajectoryPath: "trajectories/run-import-cycle.jsonl"},
+	}
+
+	frontier := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabFrontier}, 100, record.Result.TrajectoryPath)
+	for _, want := range []string{"Active: Resolve the Go import cycle", "Next", "Open", "Which shared type"} {
+		if !strings.Contains(frontier, want) {
+			t.Fatalf("expected compact frontier to contain %q, got:\n%s", want, frontier)
+		}
+	}
+	for _, unwanted := range []string{"Directions", "Stop Conditions", "Risks"} {
+		if strings.Contains(frontier, unwanted) {
+			t.Fatalf("expected compact frontier to hide %q, got:\n%s", unwanted, frontier)
+		}
+	}
+	frontierDebug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabFrontier, Debug: true}, 100, record.Result.TrajectoryPath)
+	for _, want := range []string{"Directions", "Stop Conditions", "Risks"} {
+		if !strings.Contains(frontierDebug, want) {
+			t.Fatalf("expected debug frontier to contain %q, got:\n%s", want, frontierDebug)
+		}
+	}
+
+	memory := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabMemory}, 100, record.Result.TrajectoryPath)
+	if !strings.Contains(memory, "No memory used in this run.") || strings.Contains(memory, "Policy") {
+		t.Fatalf("expected compact memory tab to show one-line empty state, got:\n%s", memory)
+	}
+	memoryDebug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabMemory, Debug: true}, 100, record.Result.TrajectoryPath)
+	if !strings.Contains(memoryDebug, "Policy") {
+		t.Fatalf("expected debug memory tab to show policy, got:\n%s", memoryDebug)
+	}
+
+	events := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabEvents}, 100, record.Result.TrajectoryPath)
+	for _, want := range []string{"symptom_detected", "direction_created", "evidence_added"} {
+		if !strings.Contains(events, want) {
+			t.Fatalf("expected compact events to contain %q, got:\n%s", want, events)
+		}
+	}
+	for _, unwanted := range []string{"trace_span_ended", "prompt_snapshot", "frontier_updated"} {
+		if strings.Contains(events, unwanted) {
+			t.Fatalf("expected compact events to hide %q, got:\n%s", unwanted, events)
+		}
+	}
+	eventsDebug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabEvents, Debug: true}, 100, record.Result.TrajectoryPath)
+	for _, want := range []string{"trace_span_ended", "prompt_snapshot", "frontier_updated"} {
+		if !strings.Contains(eventsDebug, want) {
+			t.Fatalf("expected debug events to contain %q, got:\n%s", want, eventsDebug)
+		}
+	}
+
+	prompt := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabPrompt}, 100, record.Result.TrajectoryPath)
+	for _, want := range []string{"Latest Prompt: prompt-1 step=1", "Context", "Investigation Frontier: yes"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected compact prompt to contain %q, got:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Model: mock") || strings.Contains(prompt, "included=yes") {
+		t.Fatalf("expected compact prompt to hide verbose block metadata, got:\n%s", prompt)
+	}
+	promptDebug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabPrompt, Debug: true}, 100, record.Result.TrajectoryPath)
+	for _, want := range []string{"Model: mock", "included=yes"} {
+		if !strings.Contains(promptDebug, want) {
+			t.Fatalf("expected debug prompt to contain %q, got:\n%s", want, promptDebug)
+		}
+	}
+}
+
 func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 	record := taskRecord{
 		Task:   core.Task{Text: "fix go test import cycle", Repo: "/repo"},
@@ -318,27 +387,66 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 
 	for _, want := range []string{
 		"Problem Trace Workspace",
-		"[1 Trace]  2 Frontier  3 Memory  4 Events  5 Prompt  6 Cards",
-		"Trace ID: trace-import-cycle",
-		"Trajectory: trajectories/run-import-cycle.jsonl",
-		"Repository: /repo",
+		"[1 Trace]  2 Next  3 Memory  4 Events  5 Prompt  6 Learn",
 		"Task: fix go test import cycle",
-		"Current Symptom: Go compile failed with import cycle not allowed: go test ./...",
+		"Validation: not recorded",
+		"Active: Resolve the Go import cycle",
+		"Symptom: Go compile failed with import cycle not allowed: go test ./...",
 		"Trace Tree",
 		"> [-] * Problem  problem  running",
 		"+-- [ ] + Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
 		"+-- [-] + Resolve the Go import cycle  direction  supported",
 		"|   `-- [ ] + package service imports handler and handler imports service  evidence  supports",
 		"+-- [ ] + Prompt snapshot 1  prompt  captured",
-		"Selected Node",
-		"ID: node-root",
+		"Selected",
+		"Item: Problem",
+		"Why: fix go test import cycle",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected rendered trace tree to contain %q, got:\n%s", want, rendered)
 		}
 	}
-	if strings.Contains(rendered, "Span Graph") {
-		t.Fatalf("expected trace tab to omit span graph, got:\n%s", rendered)
+	for _, unwanted := range []string{
+		"Trace ID:",
+		"Trajectory:",
+		"Repository:",
+		"Selected Node",
+		"ID: node-root",
+		"Span Graph",
+	} {
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("expected compact trace view to hide %q, got:\n%s", unwanted, rendered)
+		}
+	}
+}
+
+func TestTraceWorkspaceDebugRevealsTraceMetadata(t *testing.T) {
+	record := taskRecord{
+		Task:   core.Task{Text: "fix go test import cycle", Repo: "/repo"},
+		Events: mockImportCycleProblemTraceEvents(),
+		Result: agentpkg.Result{TrajectoryPath: "trajectories/run-import-cycle.jsonl"},
+	}
+
+	state := traceWorkspaceState{
+		Tab:   traceTabTrace,
+		Debug: true,
+		Expanded: map[string]bool{
+			"node-root": true,
+		},
+	}
+	rendered := traceWorkspaceViewWidth(record, state, 120, record.Result.TrajectoryPath)
+
+	for _, want := range []string{
+		"Debug",
+		"Trace ID: trace-import-cycle",
+		"Trajectory: trajectories/run-import-cycle.jsonl",
+		"Repository: /repo",
+		"ID: node-root",
+		"Kind: problem",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected debug trace view to contain %q, got:\n%s", want, rendered)
+		}
 	}
 }
 
@@ -816,6 +924,37 @@ func TestTraceWorkspaceJKScrollsNonTreeTabs(t *testing.T) {
 	}
 }
 
+func TestTraceWorkspaceDTogglesDebug(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 12
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix go test import cycle", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+	model.detail.LineDown(3)
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+
+	if !model.traceView.Debug {
+		t.Fatalf("expected trace debug mode to be enabled")
+	}
+	if model.detail.YOffset != 0 {
+		t.Fatalf("expected debug toggle to reset viewport, got %d", model.detail.YOffset)
+	}
+	if detail := model.detailContent(); !strings.Contains(detail, "Trace ID: trace-import-cycle") {
+		t.Fatalf("expected debug detail to reveal trace metadata, got:\n%s", detail)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if model.traceView.Debug {
+		t.Fatalf("expected trace debug mode to be disabled")
+	}
+	if detail := model.detailContent(); strings.Contains(detail, "Trace ID: trace-import-cycle") {
+		t.Fatalf("expected compact detail to hide trace metadata, got:\n%s", detail)
+	}
+}
+
 func TestTraceWorkspaceTabNavigationResetsViewport(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	model.width = 120
@@ -823,6 +962,7 @@ func TestTraceWorkspaceTabNavigationResetsViewport(t *testing.T) {
 	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Now())
 	model.tasks[taskIndex].Events = scrollableTraceWorkspaceEvents()
 	model.setSelectedTask(taskIndex)
+	model.traceView.Debug = true
 
 	model.detail.YOffset = 4
 	model.openTraceWorkspace()

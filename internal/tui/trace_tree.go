@@ -212,14 +212,26 @@ func flattenTraceTree(vm TraceTreeVM, expanded map[string]bool) []TraceTreeRow {
 	return rows
 }
 
-func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWorkspaceState, width int) {
+func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWorkspaceState, width int, record taskRecord) {
 	trace := vm.Trace
-	writeField(b, "Trace ID", trace.TraceID, width)
-	writeField(b, "Trajectory", vm.TrajectoryPath, width)
-	writeField(b, "Repository", trace.Problem.Repo, width)
-	writeField(b, "Task", trace.Problem.UserTask, width)
+	snapshot := BuildRunSnapshot(record, vm.TrajectoryPath)
+	writeField(b, "Task", shortString(trace.Problem.UserTask, 120), width)
+	writeField(b, "Status", traceRunStatus(record), width)
+	writeField(b, "Validation", validationSummary(snapshot), width)
+	if snapshot.FinalReview.ChangedFiles > 0 {
+		writeField(b, "Diff", fmt.Sprintf("%d files changed", snapshot.FinalReview.ChangedFiles), width)
+	}
+	if active := activeDirectionSummary(trace); active != "none" {
+		writeField(b, "Active", active, width)
+	}
 	if trace.Problem.ErrorSummary != "" {
-		writeField(b, "Current Symptom", trace.Problem.ErrorSummary, width)
+		writeField(b, "Symptom", trace.Problem.ErrorSummary, width)
+	}
+	if state.Debug {
+		writeSection(b, "Debug")
+		writeField(b, "Trace ID", trace.TraceID, width)
+		writeField(b, "Trajectory", vm.TrajectoryPath, width)
+		writeField(b, "Repository", trace.Problem.Repo, width)
 	}
 
 	b.WriteByte('\n')
@@ -228,7 +240,7 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 	if vm.Selected != nil && len(vm.Rows) > 0 {
 		cursor := traceCursorForRows(state, vm.Rows)
 		b.WriteByte('\n')
-		b.WriteString(renderTraceNodeInspector(vm.Rows[cursor], *vm.Selected, width))
+		b.WriteString(renderTraceNodeInspector(vm.Rows[cursor], *vm.Selected, width, state.Debug))
 	}
 
 	// Keep the Trace tab focused on the problem tree and selected node details.
@@ -261,8 +273,8 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 			}
 		}
 
-		line := fmt.Sprintf("%s%s%s%s %s %s", selection, row.Prefix, row.Connector, twisty, traceStatusASCII(row.Status), row.Title)
-		if kind := traceKindLabel(row.Kind); kind != "" {
+		line := fmt.Sprintf("%s%s%s%s %s %s", selection, row.Prefix, row.Connector, twisty, traceStatusASCII(row.Status), displayTraceRowTitle(row))
+		if kind := displayTraceKindLabel(row.Kind, row.NodeID, row.Title); kind != "" {
 			line += "  " + kind
 		}
 		if row.Status != "" {
@@ -285,17 +297,34 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
-func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int) string {
+func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int, debug bool) string {
 	var b strings.Builder
-	b.WriteString("Selected Node\n")
+	b.WriteString("Selected\n")
+	writeField(&b, "Status", node.Status, width)
+	switch displayTraceKindLabel(node.Kind, node.ID, node.Title) {
+	case "direction", "observation":
+		writeField(&b, "Direction", displayTraceNodeTitle(node), width)
+	case "evidence":
+		writeField(&b, "Evidence", displayTraceNodeTitle(node), width)
+	case "symptom":
+		writeField(&b, "Symptom", displayTraceNodeTitle(node), width)
+	case "prompt":
+		writeField(&b, "Prompt", displayTraceNodeTitle(node), width)
+	default:
+		writeField(&b, "Item", displayTraceNodeTitle(node), width)
+	}
+	if node.Summary != "" {
+		writeField(&b, "Why", node.Summary, width)
+	}
+	if !debug {
+		return b.String()
+	}
+
+	writeSection(&b, "Debug")
 	writeField(&b, "ID", node.ID, width)
 	writeField(&b, "Kind", node.Kind, width)
-	writeField(&b, "Status", node.Status, width)
-	writeField(&b, "Title", node.Title, width)
-	if node.Summary != "" {
-		writeSection(&b, "Summary")
-		b.WriteString(wrapText(node.Summary, width))
-		b.WriteByte('\n')
+	if displayTraceNodeTitle(node) != node.Title {
+		writeField(&b, "Title", node.Title, width)
 	}
 	if node.DirectionID != "" {
 		writeField(&b, "Direction", node.DirectionID, width)
@@ -314,6 +343,26 @@ func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int)
 		writeField(&b, "Children", len(node.Children), width)
 	}
 	return b.String()
+}
+
+func traceRunStatus(record taskRecord) string {
+	status := valueOrDefault(record.Status, record.Result.Status)
+	return valueOrDefault(status, "pending")
+}
+
+func displayTraceRowTitle(row TraceTreeRow) string {
+	return displayDirectionTitle(row.NodeID, row.Title)
+}
+
+func displayTraceNodeTitle(node TraceTreeNodeVM) string {
+	return displayDirectionTitle(node.ID, node.Title)
+}
+
+func displayTraceKindLabel(kind, id, title string) string {
+	if isGenericObservationDirection(id, title) {
+		return "observation"
+	}
+	return traceKindLabel(kind)
 }
 
 func normalizeTraceCursor(state *traceWorkspaceState, rows []TraceTreeRow) {
