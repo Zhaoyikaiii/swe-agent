@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,6 +15,56 @@ type RunSnapshot struct {
 	Steps       []StepCard
 	Artifacts   []ArtifactCard
 	FinalReview FinalReview
+}
+
+type ItemKind string
+
+const (
+	itemUser     ItemKind = "user"
+	itemAgent    ItemKind = "agent"
+	itemTool     ItemKind = "tool"
+	itemFile     ItemKind = "file"
+	itemTest     ItemKind = "test"
+	itemApproval ItemKind = "approval"
+	itemFinal    ItemKind = "final"
+)
+
+type ItemStatus string
+
+const (
+	itemRunning ItemStatus = "running"
+	itemOK      ItemStatus = "ok"
+	itemFailed  ItemStatus = "failed"
+	itemWaiting ItemStatus = "waiting"
+	itemSkipped ItemStatus = "skipped"
+)
+
+type RiskLevel string
+
+const (
+	riskNone   RiskLevel = ""
+	riskLow    RiskLevel = "low"
+	riskMedium RiskLevel = "medium"
+	riskHigh   RiskLevel = "high"
+)
+
+type ArtifactRef struct {
+	Kind  string
+	Title string
+}
+
+type TimelineItem struct {
+	ID        string
+	Kind      ItemKind
+	Title     string
+	Summary   string
+	Detail    string
+	Status    ItemStatus
+	Risk      RiskLevel
+	StartedAt time.Time
+	Duration  time.Duration
+	Artifacts []ArtifactRef
+	Collapsed bool
 }
 
 type StepCard struct {
@@ -142,6 +193,189 @@ func BuildRunSnapshot(record taskRecord, trajectoryPath string) RunSnapshot {
 		Submission:   taskConclusion(record),
 	}
 	return snapshot
+}
+
+func BuildTimeline(record taskRecord, snapshot RunSnapshot) []TimelineItem {
+	items := make([]TimelineItem, 0, len(snapshot.Steps)+4)
+	if text := strings.TrimSpace(record.Task.Text); text != "" {
+		items = append(items, TimelineItem{
+			ID:        fmt.Sprintf("task-%d", record.ID),
+			Kind:      itemUser,
+			Title:     "You",
+			Summary:   text,
+			Detail:    text,
+			Status:    itemOK,
+			StartedAt: record.StartedAt,
+			Collapsed: true,
+		})
+	}
+
+	for i, event := range record.Events {
+		switch event.Type {
+		case "model_response":
+			content := stripFencedBlocks(strings.TrimSpace(fmt.Sprint(event.Data["content"])))
+			if content == "" {
+				continue
+			}
+			items = append(items, TimelineItem{
+				ID:        fmt.Sprintf("event-%d", i),
+				Kind:      itemAgent,
+				Title:     "Agent",
+				Summary:   shortString(content, 120),
+				Detail:    content,
+				Status:    itemOK,
+				StartedAt: event.Time,
+				Collapsed: true,
+			})
+		case "tool_denied":
+			tool := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+			if tool == "" {
+				tool = "tool"
+			}
+			items = append(items, TimelineItem{
+				ID:        fmt.Sprintf("event-%d", i),
+				Kind:      itemApproval,
+				Title:     tool,
+				Summary:   "denied",
+				Detail:    strings.TrimSpace(fmt.Sprint(event.Data["reason"])),
+				Status:    itemSkipped,
+				Risk:      riskMedium,
+				StartedAt: event.Time,
+				Collapsed: true,
+			})
+		case "error":
+			body := strings.TrimSpace(fmt.Sprint(event.Data["error"]))
+			items = append(items, TimelineItem{
+				ID:        fmt.Sprintf("event-%d", i),
+				Kind:      itemFinal,
+				Title:     "Error",
+				Summary:   shortString(body, 120),
+				Detail:    body,
+				Status:    itemFailed,
+				StartedAt: event.Time,
+				Collapsed: true,
+			})
+		}
+	}
+
+	for _, step := range snapshot.Steps {
+		kind := itemTool
+		if step.Phase == "validate" {
+			kind = itemTest
+		} else if step.Phase == "edit" {
+			kind = itemFile
+		}
+		items = append(items, TimelineItem{
+			ID:        fmt.Sprintf("step-%d", step.Index),
+			Kind:      kind,
+			Title:     valueOrDefault(step.Tool, step.Phase),
+			Summary:   timelineStepSummary(step),
+			Detail:    stepDetailWidth(step, 0),
+			Status:    timelineStatus(step.Outcome),
+			Risk:      timelineRisk(step),
+			StartedAt: step.Started,
+			Duration:  step.Duration,
+			Artifacts: timelineArtifacts(step),
+			Collapsed: true,
+		})
+	}
+
+	if snapshot.FinalReview.Status != "" && snapshot.FinalReview.Status != "running" {
+		summary := valueOrDefault(snapshot.FinalReview.Submission, "Status: "+snapshot.FinalReview.Status)
+		if body := strings.TrimSpace(record.Narrative.Body); body != "" {
+			summary = body
+		}
+		items = append(items, TimelineItem{
+			ID:      fmt.Sprintf("final-%d", record.ID),
+			Kind:    itemFinal,
+			Title:   "Review",
+			Summary: summary,
+			Detail:  summary,
+			Status:  timelineFinalStatus(snapshot.FinalReview.Status),
+			Artifacts: []ArtifactRef{
+				{Kind: "diff", Title: fmt.Sprintf("%d files", snapshot.FinalReview.ChangedFiles)},
+				{Kind: "tests", Title: validationSummary(snapshot)},
+			},
+			Collapsed: true,
+		})
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i].StartedAt
+		right := items[j].StartedAt
+		if left.IsZero() || right.IsZero() {
+			return i < j
+		}
+		return left.Before(right)
+	})
+	return items
+}
+
+func timelineStepSummary(step StepCard) string {
+	label := strings.TrimSpace(step.Command)
+	if label == "" {
+		label = strings.TrimSpace(step.Tool)
+	}
+	if label == "" {
+		label = strings.TrimSpace(step.Phase)
+	}
+	parts := []string{label}
+	if outcome := strings.TrimSpace(step.Outcome); outcome != "" {
+		parts = append(parts, outcome)
+	}
+	if step.Duration > 0 {
+		parts = append(parts, step.Duration.String())
+	}
+	return strings.Join(parts, "  ")
+}
+
+func timelineStatus(outcome string) ItemStatus {
+	outcome = strings.ToLower(strings.TrimSpace(outcome))
+	switch {
+	case outcome == "" || outcome == "running":
+		return itemRunning
+	case outcome == "ok":
+		return itemOK
+	case strings.HasPrefix(outcome, "exit ") || outcome == "timeout":
+		return itemFailed
+	case outcome == "denied":
+		return itemSkipped
+	default:
+		return itemOK
+	}
+}
+
+func timelineFinalStatus(status string) ItemStatus {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "error", "failed", "failure":
+		return itemFailed
+	case "running":
+		return itemRunning
+	default:
+		return itemOK
+	}
+}
+
+func timelineRisk(step StepCard) RiskLevel {
+	switch step.Phase {
+	case "edit":
+		return riskMedium
+	case "shell":
+		return riskLow
+	default:
+		return riskNone
+	}
+}
+
+func timelineArtifacts(step StepCard) []ArtifactRef {
+	var artifacts []ArtifactRef
+	if step.Output != "" {
+		artifacts = append(artifacts, ArtifactRef{Kind: "output", Title: "output"})
+	}
+	if len(step.EventIDs) > 0 {
+		artifacts = append(artifacts, ArtifactRef{Kind: "events", Title: formatEventIDs(step.EventIDs)})
+	}
+	return artifacts
 }
 
 func findOpenStep(steps []StepCard, tool string) int {

@@ -389,6 +389,9 @@ func TestDefaultRunSummaryHidesInternalStepTranscript(t *testing.T) {
 	if strings.Contains(detail, "Step 1") || strings.Contains(detail, "Tool Call") || strings.Contains(detail, "model_response") {
 		t.Fatalf("expected default detail to hide internal steps, got:\n%s", detail)
 	}
+	if !strings.Contains(detail, "Timeline") || !strings.Contains(detail, "go test ./...") {
+		t.Fatalf("expected default detail to render timeline tool summaries, got:\n%s", detail)
+	}
 
 	model.executeSlashCommand("/steps")
 	if model.view != viewSteps {
@@ -397,6 +400,25 @@ func TestDefaultRunSummaryHidesInternalStepTranscript(t *testing.T) {
 	steps := model.detailContent()
 	if !strings.Contains(steps, "Step 1") || !strings.Contains(steps, "go test ./...") {
 		t.Fatalf("expected explicit steps view to preserve drill-down, got:\n%s", steps)
+	}
+}
+
+func TestWideRunBodyShowsTimelineAndInspector(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 30
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "submitted", time.Now())
+	model.tasks[taskIndex].Events = []core.Event{
+		{Type: "tool_call", Data: map[string]any{"tool": "run_tests", "args": map[string]any{"command": "go test ./..."}}},
+		{Type: "tool_result", Data: map[string]any{"tool": "run_tests", "code": 0, "output": "ok"}},
+	}
+	model.setSelectedTask(taskIndex)
+	model.resize()
+
+	body := model.bodyView()
+
+	if !strings.Contains(body, "Timeline") || !strings.Contains(body, "Inspector") || !strings.Contains(body, "[Plan]") {
+		t.Fatalf("expected wide cockpit body to include timeline and inspector, got:\n%s", body)
 	}
 }
 

@@ -1500,7 +1500,21 @@ func (m *model) contentWidth() int {
 	if m.sidebar == sidebarHistory {
 		return max(20, m.width-m.sidebarWidth()-1) - 2
 	}
+	if m.cockpitLayout() {
+		return max(20, m.inspectorWidth()-2)
+	}
 	return max(20, m.width-2) - 2
+}
+
+func (m *model) cockpitLayout() bool {
+	return m.sidebar != sidebarHistory && m.width >= 108
+}
+
+func (m *model) inspectorWidth() int {
+	if m.width < 108 {
+		return 0
+	}
+	return max(32, min(44, m.width*34/100))
 }
 
 func (m *model) bodyHeight() int {
@@ -1595,10 +1609,10 @@ func (m *model) detailContent() string {
 			return "No task history yet."
 		}
 		if record := m.selectedTaskRecord(); record != nil {
-			return finalReviewWidth(*record, m.runSnapshot(*record), m.detail.Width)
+			return timelineViewWidth(*record, m.runSnapshot(*record), m.detail.Width)
 		}
 		if m.loop && !m.running {
-			return "Type a task below to start.\n\nSlash commands: /history, /clear, /quit, /help, /diff, /trace, /open-trace."
+			return "Timeline\n\nYou\n  Type a task below to start.\n\nComposer\n  /history  /clear  /quit  /help  /diff  /trace  /open-trace"
 		}
 		return "Waiting for events..."
 	}
@@ -1721,6 +1735,21 @@ func (m *model) bodyView() string {
 	m.syncDetailSize()
 	bodyHeight := m.bodyHeight()
 	if m.sidebar != sidebarHistory {
+		if m.cockpitLayout() {
+			inspectorWidth := m.inspectorWidth()
+			timelineWidth := max(40, m.width-inspectorWidth-1)
+			timeline := panelStyle.
+				Width(timelineWidth).
+				Height(bodyHeight).
+				BorderForeground(focusColor(m.focus != "detail")).
+				Render(fitHeight(m.timelinePanel(timelineWidth-2), bodyHeight-2))
+			inspector := panelStyle.
+				Width(inspectorWidth).
+				Height(bodyHeight).
+				BorderForeground(focusColor(m.focus == "detail")).
+				Render(fitHeight(m.inspectorView(inspectorWidth-2), bodyHeight-2))
+			return lipgloss.JoinHorizontal(lipgloss.Top, timeline, inspector)
+		}
 		return panelStyle.
 			Width(max(20, m.width-2)).
 			Height(bodyHeight).
@@ -1742,6 +1771,71 @@ func (m *model) bodyView() string {
 		BorderForeground(focusColor(m.focus == "detail")).
 		Render(m.detail.View())
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, detail)
+}
+
+func (m *model) timelinePanel(width int) string {
+	if record := m.selectedTaskRecord(); record != nil {
+		return timelineViewWidth(*record, m.runSnapshot(*record), width)
+	}
+	if m.loop && !m.running {
+		return "You\n  Type a task below to start.\n\nAgent\n  Waiting for instructions."
+	}
+	return "Agent\n  Waiting for events..."
+}
+
+func (m *model) inspectorView(width int) string {
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return "Inspector\n\nNo run selected."
+	}
+	snapshot := m.runSnapshot(*record)
+	var b strings.Builder
+	b.WriteString("Inspector\n")
+	b.WriteString(inspectorTabs(m.view))
+	b.WriteString("\n\n")
+	switch m.view {
+	case viewSteps:
+		b.WriteString(stepsViewWidth(snapshot, width))
+	case viewDiff:
+		if record.Result.Diff != "" {
+			b.WriteString(record.Result.Diff)
+		} else if record.Status == "running" {
+			b.WriteString("Diff is available after the run finishes.\n")
+		} else {
+			b.WriteString("No diff.\n")
+		}
+	case viewTests:
+		b.WriteString(validationViewWidth(snapshot, width))
+	case viewTrace:
+		b.WriteString("Trajectory\n\n")
+		b.WriteString(m.trajectoryPath())
+		b.WriteByte('\n')
+	default:
+		b.WriteString(planInspectorWidth(*record, snapshot, width))
+	}
+	return b.String()
+}
+
+func inspectorTabs(view detailView) string {
+	tabs := []struct {
+		view  detailView
+		label string
+	}{
+		{viewOverview, "Plan"},
+		{viewSteps, "Steps"},
+		{viewDiff, "Diff"},
+		{viewTests, "Tests"},
+		{viewTrace, "Trace"},
+	}
+	parts := make([]string, 0, len(tabs))
+	for _, tab := range tabs {
+		label := tab.label
+		if view == tab.view {
+			label = "[" + label + "]"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, " ")
 }
 
 func (m *model) inputView() string {
@@ -2403,6 +2497,114 @@ func validationViewWidth(snapshot RunSnapshot, width int) string {
 	return b.String()
 }
 
+func timelineViewWidth(record taskRecord, snapshot RunSnapshot, width int) string {
+	items := BuildTimeline(record, snapshot)
+	if len(items) == 0 {
+		return "Timeline\n\nWaiting for agent activity.\n"
+	}
+	var b strings.Builder
+	b.WriteString("Timeline\n")
+	for _, item := range items {
+		writeTimelineItem(&b, item, width)
+	}
+	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+func writeTimelineItem(b *strings.Builder, item TimelineItem, width int) {
+	icon := timelineIcon(item)
+	title := valueOrDefault(item.Title, string(item.Kind))
+	summary := strings.TrimSpace(item.Summary)
+	if summary == "" {
+		summary = strings.TrimSpace(item.Detail)
+	}
+	status := string(item.Status)
+	if status != "" && status != string(itemOK) {
+		status = "  " + status
+	} else {
+		status = ""
+	}
+	duration := ""
+	if item.Duration > 0 {
+		duration = "  " + item.Duration.String()
+	}
+	line := strings.TrimSpace(fmt.Sprintf("%s %-7s %s%s%s", icon, title, summary, status, duration))
+	b.WriteString(wrapText(line, width))
+	b.WriteByte('\n')
+	if len(item.Artifacts) > 0 {
+		b.WriteString(mutedStyle.Render(wrapText("  "+formatArtifactRefs(item.Artifacts), width)))
+		b.WriteByte('\n')
+	}
+}
+
+func timelineIcon(item TimelineItem) string {
+	switch item.Status {
+	case itemRunning:
+		return ">"
+	case itemFailed:
+		return "!"
+	case itemWaiting:
+		return "?"
+	case itemSkipped:
+		return "-"
+	}
+	switch item.Kind {
+	case itemUser:
+		return "u"
+	case itemAgent:
+		return "a"
+	case itemFile:
+		return "M"
+	case itemTest:
+		return "T"
+	case itemFinal:
+		return "*"
+	default:
+		return ">"
+	}
+}
+
+func formatArtifactRefs(refs []ArtifactRef) string {
+	parts := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		label := strings.TrimSpace(ref.Kind)
+		if ref.Title != "" {
+			label += ":" + strings.TrimSpace(ref.Title)
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func planInspectorWidth(record taskRecord, snapshot RunSnapshot, width int) string {
+	var b strings.Builder
+	b.WriteString("Plan\n")
+	writeField(&b, "Goal", record.Task.Text, width)
+	writeField(&b, "Status", valueOrDefault(record.Status, "pending"), width)
+	if duration := taskDuration(record); duration != "" {
+		writeField(&b, "Elapsed", duration, width)
+	}
+	writeSection(&b, "Files")
+	diff := "none"
+	if snapshot.FinalReview.ChangedFiles > 0 {
+		diff = fmt.Sprintf("%d changed", snapshot.FinalReview.ChangedFiles)
+	} else if record.Result.Diff != "" {
+		diff = "available"
+	}
+	writeField(&b, "Diff", diff, width)
+	writeField(&b, "Tests", validationSummary(snapshot), width)
+	trace := "not available"
+	if snapshot.FinalReview.Trajectory != "" {
+		trace = "available"
+	}
+	writeField(&b, "Trace", trace, width)
+	if errText := strings.TrimSpace(lastErrorText(record)); errText != "" {
+		writeSection(&b, "Risk")
+		b.WriteString(wrapText(errText, width))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 func formatEventIDs(ids []int) string {
 	parts := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -2750,6 +2952,23 @@ func fillLine(left, right string, width int) string {
 		return truncate(left+right, width)
 	}
 	return left + strings.Repeat(" ", width-len(leftRunes)-len(rightRunes)) + right
+}
+
+func fitHeight(content string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) > height {
+		if height == 1 {
+			return truncate(lines[0], max(1, len([]rune(lines[0]))))
+		}
+		lines = append(lines[:height-1], "...")
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func clamp(v, low, high int) int {
