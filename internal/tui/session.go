@@ -1493,7 +1493,7 @@ func (m *model) syncDetailSize() {
 		return
 	}
 	m.detail.Width = m.contentWidth()
-	m.detail.Height = max(1, m.bodyHeight()-2)
+	m.detail.Height = max(1, m.bodyHeight())
 }
 
 func (m *model) contentWidth() int {
@@ -1758,16 +1758,17 @@ func (m *model) bodyView() string {
 		if m.cockpitLayout() {
 			inspectorWidth := m.inspectorWidth()
 			timelineWidth := max(40, m.width-inspectorWidth-1)
+			contentHeight := max(1, bodyHeight)
 			timeline := panelStyle.
 				Width(timelineWidth).
-				Height(bodyHeight).
+				Height(contentHeight).
 				BorderForeground(focusColor(m.focus != "detail")).
-				Render(fitHeight(m.timelinePanel(timelineWidth-2), bodyHeight-2))
+				Render(fitHeight(m.timelinePanel(timelineWidth-2), contentHeight))
 			inspector := panelStyle.
 				Width(inspectorWidth).
-				Height(bodyHeight).
+				Height(contentHeight).
 				BorderForeground(focusColor(m.focus == "detail")).
-				Render(fitHeight(m.inspectorView(inspectorWidth-2), bodyHeight-2))
+				Render(fitHeight(m.inspectorView(inspectorWidth-2), contentHeight))
 			return lipgloss.JoinHorizontal(lipgloss.Top, timeline, inspector)
 		}
 		return panelStyle.
@@ -1784,7 +1785,7 @@ func (m *model) bodyView() string {
 		Width(sidebarWidth).
 		Height(bodyHeight).
 		BorderForeground(focusColor(m.focus == "sidebar")).
-		Render(m.sidebarView(sidebarWidth-2, bodyHeight-2))
+		Render(m.sidebarView(sidebarWidth-2, bodyHeight))
 	detail := panelStyle.
 		Width(detailWidth).
 		Height(bodyHeight).
@@ -1869,13 +1870,13 @@ func (m *model) inputView() string {
 		prompt = "Task"
 	default:
 		if m.running {
-			prompt = "Queue"
+			prompt = "Busy"
 		}
 	}
 	label := inputLabelStyle.Render(" " + prompt + " ")
 	frameW, _ := inputBoxStyle.GetFrameSize()
 	boxWidth := max(1, m.width-frameW)
-	inputWidth := max(8, boxWidth-lipgloss.Width(label)-3)
+	inputWidth := max(1, boxWidth-lipgloss.Width(label)-3)
 	m.command.Width = inputWidth
 	line := lipgloss.JoinHorizontal(lipgloss.Top,
 		label,
@@ -1982,7 +1983,11 @@ func (m *model) footerView() string {
 	shortcuts := m.help.ShortHelpView(m.shortHelp())
 	status := valueOrDefault(m.status, m.statusHint())
 	left := fmt.Sprintf(" %s: %s", m.phaseLabel(), status)
-	left = truncate(left, max(10, m.width-len(shortcuts)-4))
+	shortcutWidth := lipgloss.Width(shortcuts)
+	if shortcutWidth+4 >= m.width {
+		return footerStyle.Width(m.width).Render(truncate(left, max(1, m.width)))
+	}
+	left = truncate(left, max(1, m.width-shortcutWidth-4))
 	return footerStyle.Width(m.width).Render(fillLine(left, shortcuts+" ", m.width))
 }
 
@@ -1999,17 +2004,29 @@ func (m *model) helpOverlayView() string {
 }
 
 func (m *model) helpDialog() string {
-	dialogWidth := max(1, min(88, m.width-4))
-	dialogHeight := max(1, min(22, m.height-2))
-	if dialogWidth < min(32, m.width) {
-		dialogWidth = min(32, m.width)
-	}
-	if dialogHeight < min(8, m.height) {
-		dialogHeight = min(8, m.height)
+	if m.width <= 0 || m.height <= 0 {
+		return ""
 	}
 	frameW, frameH := helpDialogStyle.GetFrameSize()
-	innerWidth := max(20, dialogWidth-frameW)
-	innerHeight := max(1, dialogHeight-frameH)
+
+	outerWidth := min(88, max(1, m.width-4))
+	if m.width >= 36 {
+		outerWidth = max(32, outerWidth)
+	}
+	outerWidth = min(outerWidth, m.width)
+
+	outerHeight := min(22, max(1, m.height-2))
+	if m.height >= 10 {
+		outerHeight = max(8, outerHeight)
+	}
+	outerHeight = min(outerHeight, m.height)
+
+	if outerWidth <= frameW || outerHeight <= frameH {
+		return fitHeight(wrapText("Help\nesc/q/? close", max(1, m.width)), max(1, m.height))
+	}
+
+	innerWidth := max(1, outerWidth-frameW)
+	innerHeight := max(1, outerHeight-frameH)
 	m.help.Width = innerWidth
 	content := fitHeight(m.helpContent(innerWidth), innerHeight)
 	return helpDialogStyle.
@@ -2023,7 +2040,7 @@ func (m *model) helpContent(width int) string {
 		"Help",
 		"Close: esc/q/?",
 		"",
-		wrapText("The bottom composer is the stable place for tasks and slash commands. During a run it stays visible as Queue while the timeline and inspector update above it.", width),
+		wrapText("The bottom composer is the stable place for tasks and slash commands. During a run it stays visible as a status area while the timeline and inspector update above it.", width),
 		"",
 		"Composer",
 		wrapText("  i starts task input. Enter submits. Slash commands work from the composer, for example /history or /diff.", width),

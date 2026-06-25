@@ -346,6 +346,55 @@ func TestSlashHelpShowsTutorialOverlay(t *testing.T) {
 	}
 }
 
+func TestHelpOverlayFitsTinyTerminal(t *testing.T) {
+	for _, size := range []struct{ w, h int }{
+		{20, 8},
+		{30, 10},
+		{40, 12},
+	} {
+		model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+		model.width = size.w
+		model.height = size.h
+		model.mode = modeTask
+		model.resize()
+		model.executeSlashCommand("/help")
+
+		view := model.View()
+		if got := lipgloss.Height(view); got > size.h {
+			t.Fatalf("height=%d exceeds terminal height=%d\n%s", got, size.h, view)
+		}
+		for _, line := range strings.Split(view, "\n") {
+			if got := lipgloss.Width(line); got > size.w {
+				t.Fatalf("line width=%d exceeds terminal width=%d\n%s", got, size.w, view)
+			}
+		}
+	}
+}
+
+func TestHelpOverlayRestoresApprovalMode(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	response := make(chan policy.ApprovalDecision, 1)
+
+	model.Update(approvalMsg{
+		request: policy.ApprovalRequest{
+			Call: core.ToolCall{Name: "apply_patch"},
+			Spec: core.ToolSpec{Name: "apply_patch"},
+			Risk: core.RiskWrite,
+		},
+		response: response,
+	})
+
+	model.openHelp()
+	if model.mode != modeHelp {
+		t.Fatalf("expected help mode, got %v", model.mode)
+	}
+
+	model.handleHelpKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if model.mode != modeApproval {
+		t.Fatalf("expected approval mode after closing help, got %v", model.mode)
+	}
+}
+
 func TestHistoryEnterSwitchesSelectedTaskWorkbench(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	model.detail.Width = 80
@@ -473,7 +522,7 @@ func TestComposerStaysVisibleWithinTerminalHeight(t *testing.T) {
 		if got := lipgloss.Height(view); got > tc.height {
 			t.Fatalf("view height=%d exceeds terminal height=%d for width=%d mode=%v\n%s", got, tc.height, tc.width, tc.mode, view)
 		}
-		if !strings.Contains(view, "Task") && !strings.Contains(view, "Queue") && !strings.Contains(view, "Message") {
+		if !strings.Contains(view, "Task") && !strings.Contains(view, "Busy") && !strings.Contains(view, "Message") {
 			t.Fatalf("composer not visible for width=%d height=%d mode=%v\n%s", tc.width, tc.height, tc.mode, view)
 		}
 	}
