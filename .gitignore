@@ -2,3 +2,4 @@ trajectories/
 **/trajectories/
 /sweagent
 /bin/
+/.local/

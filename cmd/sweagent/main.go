@@ -64,7 +64,7 @@ type agentOptions struct {
 
 func defaultAgentOptions() agentOptions {
 	return agentOptions{
-		configPath: "configs/default.yaml",
+		configPath: config.DefaultPath(),
 		repo:       ".",
 	}
 }
@@ -216,7 +216,7 @@ func printTextResult(result agentpkg.Result) {
 
 func toolsCommand(args []string) error {
 	fs := flag.NewFlagSet("tools", flag.ContinueOnError)
-	configPath := fs.String("config", "configs/default.yaml", "path to YAML config")
+	configPath := fs.String("config", config.DefaultPath(), "path to YAML config")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -234,7 +234,7 @@ func toolsCommand(args []string) error {
 
 func configCommand(args []string) error {
 	fs := flag.NewFlagSet("config", flag.ContinueOnError)
-	configPath := fs.String("config", "configs/default.yaml", "path to YAML config")
+	configPath := fs.String("config", config.DefaultPath(), "path to YAML config")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
