@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,7 +83,7 @@ func TestCodexCLICompleteUsesOutputLastMessage(t *testing.T) {
 		t.Fatalf("read captured args: %v", err)
 	}
 	args := string(argsBytes)
-	for _, want := range []string{"exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "--ask-for-approval", "never", "-C", "/repo", "-m", "gpt-5"} {
+	for _, want := range []string{"exec", "--ephemeral", "--skip-git-repo-check", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "-C", "/repo", "-m", "gpt-5"} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("args missing %q:\n%s", want, args)
 		}
@@ -90,6 +91,108 @@ func TestCodexCLICompleteUsesOutputLastMessage(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(args), "\n")
 	if len(lines) < 5 || lines[0] != "--sandbox" || lines[2] != "--ask-for-approval" || lines[4] != "exec" {
 		t.Fatalf("approval and sandbox flags should be top-level args before exec:\n%s", args)
+	}
+}
+
+func TestCodexCLICompleteFallsBackToJSONStdout(t *testing.T) {
+	dir := t.TempDir()
+	fakeCodex := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"out=\"\"\n" +
+		"while [ \"$#\" -gt 0 ]; do\n" +
+		"  case \"$1\" in\n" +
+		"    --output-last-message)\n" +
+		"      shift\n" +
+		"      out=\"$1\"\n" +
+		"      ;;\n" +
+		"  esac\n" +
+		"  shift\n" +
+		"done\n" +
+		"cat >/dev/null\n" +
+		": > \"$out\"\n" +
+		"printf '%s\\n' '{\"type\":\"agent_message\",\"message\":\"```swe_shell\\nsubmit\\n```\"}'\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+
+	m, err := NewCodexCLI(CodexCLIOptions{Command: fakeCodex})
+	if err != nil {
+		t.Fatalf("NewCodexCLI: %v", err)
+	}
+	resp, err := m.Complete(context.Background(), core.ModelRequest{
+		Messages: []core.Message{{Role: core.RoleUser, Content: "finish"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got := resp.Message.Content; got != "```swe_shell\nsubmit\n```" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+}
+
+func TestCodexCLICompleteReportsDiagnosticsForEmptyMessage(t *testing.T) {
+	dir := t.TempDir()
+	fakeCodex := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"out=\"\"\n" +
+		"while [ \"$#\" -gt 0 ]; do\n" +
+		"  case \"$1\" in\n" +
+		"    --output-last-message)\n" +
+		"      shift\n" +
+		"      out=\"$1\"\n" +
+		"      ;;\n" +
+		"  esac\n" +
+		"  shift\n" +
+		"done\n" +
+		"cat >/dev/null\n" +
+		": > \"$out\"\n" +
+		"printf '%s\\n' '{\"type\":\"session.started\"}'\n" +
+		"printf '%s\\n' 'auth or config detail' >&2\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+
+	m, err := NewCodexCLI(CodexCLIOptions{Command: fakeCodex})
+	if err != nil {
+		t.Fatalf("NewCodexCLI: %v", err)
+	}
+	_, err = m.Complete(context.Background(), core.ModelRequest{
+		Messages: []core.Message{{Role: core.RoleUser, Content: "finish"}},
+	})
+	if err == nil {
+		t.Fatal("expected empty message error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"codex exec returned an empty message",
+		"codex command:",
+		"--json",
+		"output_last_message:",
+		"stdout:",
+		"session.started",
+		"stderr:",
+		"auth or config detail",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestExtractCodexJSONMessageCombinesDeltas(t *testing.T) {
+	first, err := json.Marshal(map[string]string{"type": "agent_message_delta", "delta": "```swe_shell\n"})
+	if err != nil {
+		t.Fatalf("marshal first delta: %v", err)
+	}
+	second, err := json.Marshal(map[string]string{"type": "agent_message_delta", "delta": "submit\n```"})
+	if err != nil {
+		t.Fatalf("marshal second delta: %v", err)
+	}
+	stdout := string(first) + "\n" + string(second)
+
+	got := extractCodexJSONMessage(stdout)
+	if got != "```swe_shell\nsubmit\n```" {
+		t.Fatalf("extractCodexJSONMessage() = %q", got)
 	}
 }
 

@@ -7,14 +7,18 @@ import (
 )
 
 func TestRunCommandMockSubmit(t *testing.T) {
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
+	dir := t.TempDir()
 	repo := t.TempDir()
 	trajectoryDir := t.TempDir()
-	configPath := filepath.Join(wd, "..", "..", "configs", "default.yaml")
-	err = run([]string{"run", "--config", configPath, "--repo", repo, "--task", "finish", "--trajectory-dir", trajectoryDir, "--json"})
+	configPath := filepath.Join(dir, "config.yaml")
+	config := "model:\n" +
+		"  provider: mock\n" +
+		"trajectory:\n" +
+		"  dir: " + trajectoryDir + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	err := run([]string{"run", "--config", configPath, "--repo", repo, "--task", "finish", "--json"})
 	if err != nil {
 		t.Fatalf("run command returned error: %v", err)
 	}

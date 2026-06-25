@@ -4,8 +4,8 @@ agent:
   wall_time_seconds: 3600
   action_mode: shell
 model:
-  provider: mock
-  model: mock
+  provider: codex-cli
+  model: ""
   api_key_env: OPENAI_API_KEY
   temperature: 0.1
   max_tokens: 2048

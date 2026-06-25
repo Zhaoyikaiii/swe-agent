@@ -65,8 +65,8 @@ func DefaultConfig() Config {
 			SystemPrompt:    defaultSystemPrompt,
 		},
 		Model: ModelConfig{
-			Provider:       "mock",
-			Model:          "mock",
+			Provider:       "codex-cli",
+			Model:          "",
 			APIKeyEnv:      "OPENAI_API_KEY",
 			Temperature:    0.1,
 			MaxTokens:      2048,

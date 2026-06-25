@@ -1,12 +1,15 @@
 package model
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,26 +79,42 @@ func (m *CodexCLI) Complete(ctx context.Context, req core.ModelRequest) (core.Mo
 	cmd.Stderr = &stderr
 
 	start := time.Now()
-	if err := cmd.Run(); err != nil {
-		return core.ModelResponse{}, fmt.Errorf("codex exec failed: %w stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	runErr := cmd.Run()
+	elapsed := time.Since(start)
+
+	contentBytes, readErr := os.ReadFile(outputPath)
+	diag := codexExecDiagnostics{
+		command:    m.Command,
+		args:       args,
+		elapsed:    elapsed,
+		outputPath: outputPath,
+		outputSize: len(contentBytes),
+		readErr:    readErr,
+		stdout:     stdout.String(),
+		stderr:     stderr.String(),
 	}
-	contentBytes, err := os.ReadFile(outputPath)
-	if err != nil {
-		return core.ModelResponse{}, fmt.Errorf("read codex last message: %w stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	if runErr != nil {
+		return core.ModelResponse{}, fmt.Errorf("codex exec failed: %w\n%s", runErr, diag.String())
 	}
-	content := strings.TrimSpace(string(contentBytes))
+	content := ""
+	if readErr == nil {
+		content = strings.TrimSpace(string(contentBytes))
+	}
 	if content == "" {
-		content = strings.TrimSpace(stdout.String())
+		content = extractCodexJSONMessage(stdout.String())
+	}
+	if content == "" && readErr != nil {
+		return core.ModelResponse{}, fmt.Errorf("read codex last message: %w\n%s", readErr, diag.String())
 	}
 	if content == "" {
-		return core.ModelResponse{}, fmt.Errorf("codex exec returned an empty message")
+		return core.ModelResponse{}, fmt.Errorf("codex exec returned an empty message\n%s", diag.String())
 	}
 	return core.ModelResponse{
 		Message: core.Message{Role: core.RoleAssistant, Content: content},
 		Usage: core.Usage{
 			OutputTokens: len(content) / 4,
 		},
-		FinishReason: fmt.Sprintf("codex-cli elapsed=%s", time.Since(start).Truncate(time.Millisecond)),
+		FinishReason: fmt.Sprintf("codex-cli elapsed=%s", elapsed.Truncate(time.Millisecond)),
 	}, nil
 }
 
@@ -107,7 +126,7 @@ func (m *CodexCLI) args(workingDir, outputPath string) []string {
 	if m.ApprovalPolicy != "" {
 		args = append(args, "--ask-for-approval", m.ApprovalPolicy)
 	}
-	args = append(args, "exec", "--ephemeral", "--skip-git-repo-check", "--output-last-message", outputPath)
+	args = append(args, "exec", "--ephemeral", "--skip-git-repo-check", "--json", "--output-last-message", outputPath)
 	if workingDir != "" {
 		args = append(args, "-C", workingDir)
 	}
@@ -126,6 +145,179 @@ func (m *CodexCLI) args(workingDir, outputPath string) []string {
 	args = append(args, m.ExtraArgs...)
 	args = append(args, "-")
 	return args
+}
+
+type codexExecDiagnostics struct {
+	command    string
+	args       []string
+	elapsed    time.Duration
+	outputPath string
+	outputSize int
+	readErr    error
+	stdout     string
+	stderr     string
+}
+
+func (d codexExecDiagnostics) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "codex command: %s\n", shellQuote(append([]string{d.command}, d.args...)))
+	fmt.Fprintf(&b, "elapsed: %s\n", d.elapsed.Truncate(time.Millisecond))
+	fmt.Fprintf(&b, "output_last_message: %s size=%d", d.outputPath, d.outputSize)
+	if d.readErr != nil {
+		fmt.Fprintf(&b, " read_error=%v", d.readErr)
+	}
+	b.WriteByte('\n')
+	fmt.Fprintf(&b, "stdout:\n%s\n", indentDiagnostic(previewDiagnostic(d.stdout)))
+	fmt.Fprintf(&b, "stderr:\n%s", indentDiagnostic(previewDiagnostic(d.stderr)))
+	return b.String()
+}
+
+func shellQuote(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "" {
+			quoted = append(quoted, "''")
+			continue
+		}
+		if strings.IndexFunc(arg, func(r rune) bool {
+			return !(r == '-' || r == '_' || r == '.' || r == '/' || r == ':' || r == '=' || r == '+' || r == ',' ||
+				(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'))
+		}) == -1 {
+			quoted = append(quoted, arg)
+			continue
+		}
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func previewDiagnostic(s string) string {
+	const limit = 4096
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "<empty>"
+	}
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "\n<truncated>"
+}
+
+func indentDiagnostic(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = "  " + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func extractCodexJSONMessage(stdout string) string {
+	scanner := bufio.NewScanner(strings.NewReader(stdout))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var last string
+	var delta strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var value any
+		if err := json.Unmarshal([]byte(line), &value); err != nil {
+			continue
+		}
+		if message := extractAssistantMessage(value); strings.TrimSpace(message) != "" {
+			if isAssistantDelta(value) {
+				delta.WriteString(message)
+				last = delta.String()
+				continue
+			}
+			delta.Reset()
+			last = message
+		}
+	}
+	return strings.TrimSpace(last)
+}
+
+func isAssistantDelta(value any) bool {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	typeHint := strings.ToLower(firstString(obj, "type", "event", "kind", "name"))
+	if strings.Contains(typeHint, "delta") {
+		return true
+	}
+	if _, ok := obj["delta"]; ok {
+		return true
+	}
+	for _, key := range []string{"msg", "message", "item"} {
+		if nested, ok := obj[key]; ok && isAssistantDelta(nested) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractAssistantMessage(value any) string {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	if nested, ok := obj["msg"]; ok {
+		if message := extractAssistantMessage(nested); message != "" {
+			return message
+		}
+	}
+	if nested, ok := obj["message"]; ok {
+		if message := extractAssistantMessage(nested); message != "" {
+			return message
+		}
+	}
+	if nested, ok := obj["item"]; ok {
+		if message := extractAssistantMessage(nested); message != "" {
+			return message
+		}
+	}
+
+	typeHint := strings.ToLower(firstString(obj, "type", "event", "kind", "name"))
+	role := strings.ToLower(firstString(obj, "role"))
+	if role == "assistant" || strings.Contains(typeHint, "assistant") || strings.Contains(typeHint, "agent_message") {
+		return extractText(obj)
+	}
+	return ""
+}
+
+func firstString(obj map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := obj[key].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func extractText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := strings.TrimSpace(extractText(item)); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		for _, key := range []string{"content", "text", "message", "output", "delta"} {
+			if text := extractText(v[key]); strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 func buildCodexPrompt(req core.ModelRequest) string {
