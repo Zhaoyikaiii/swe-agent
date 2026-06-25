@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	agentpkg "github.com/local/swe-agent/internal/agent"
 	"github.com/local/swe-agent/internal/core"
+	mockmodel "github.com/local/swe-agent/internal/model"
 	"github.com/local/swe-agent/internal/policy"
 )
 
@@ -148,6 +149,101 @@ func TestSummaryDoesNotTreatSubmittedPlaceholderAsConclusion(t *testing.T) {
 	}
 	if strings.Contains(detail, "Agent summary: submitted") {
 		t.Fatalf("expected submitted placeholder to be ignored, got:\n%s", detail)
+	}
+}
+
+func TestFinalReviewUsesNarrativeBeforeFallback(t *testing.T) {
+	record := taskRecord{
+		Task:      core.Task{Text: "fix it", Repo: "/repo"},
+		Status:    "submitted",
+		Narrative: RunNarrative{Status: "generated", Body: "The run completed successfully.\n\nEvidence: validation passed."},
+		Result:    agentpkg.Result{Status: "submitted"},
+	}
+	snapshot := BuildRunSnapshot(record, "")
+
+	detail := finalReviewWidth(record, snapshot, 80)
+
+	if !strings.Contains(detail, "The run completed successfully.") {
+		t.Fatalf("expected generated narrative, got:\n%s", detail)
+	}
+	if strings.Contains(detail, "Status: submitted") || strings.Contains(detail, "Need attention") {
+		t.Fatalf("expected narrative to replace template fields, got:\n%s", detail)
+	}
+}
+
+func TestFinalReviewShowsPendingNarrativeWithFallback(t *testing.T) {
+	record := taskRecord{
+		Task:      core.Task{Text: "fix it", Repo: "/repo"},
+		Status:    "submitted",
+		Narrative: RunNarrative{Status: "pending"},
+		Result:    agentpkg.Result{Status: "submitted"},
+	}
+	snapshot := BuildRunSnapshot(record, "")
+
+	detail := finalReviewWidth(record, snapshot, 80)
+
+	if !strings.Contains(detail, "Status: submitted") || !strings.Contains(detail, "Generating review...") {
+		t.Fatalf("expected fallback plus pending marker, got:\n%s", detail)
+	}
+}
+
+func TestOverviewBodyUsesSingleFullWidthPanel(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 100
+	model.height = 30
+	model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "submitted", time.Now())
+	model.setSelectedTask(0)
+	model.resize()
+
+	body := model.bodyView()
+
+	if strings.Contains(body, "Run #1") {
+		t.Fatalf("expected overview body to omit run sidebar, got:\n%s", body)
+	}
+	if model.detail.Width != 96 {
+		t.Fatalf("expected full-width detail viewport, got %d", model.detail.Width)
+	}
+}
+
+func TestRunDoneStartsAsyncNarrativeGeneration(t *testing.T) {
+	session := NewSession()
+	ag := &agentpkg.Agent{Model: mockmodel.NewMock([]string{"The generated review."})}
+	model := newLoopModel(session, ag, "/repo", context.Background())
+	model.detail.Width = 80
+	model.startRun(core.Task{Text: "fix it"})
+	defer model.cancel()
+
+	_, cmd := model.Update(runDoneMsg{result: agentpkg.Result{Status: "submitted"}, err: nil})
+	if cmd == nil {
+		t.Fatal("expected batched command after run done")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected batch message, got %T", msg)
+	}
+	var narrative narrativeReadyMsg
+	found := false
+	for _, batchCmd := range batch {
+		if ready, ok := batchCmd().(narrativeReadyMsg); ok {
+			narrative = ready
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected narrative generation command in batch")
+	}
+	if narrative.err != nil || narrative.body != "The generated review." {
+		t.Fatalf("unexpected narrative result: body=%q err=%v", narrative.body, narrative.err)
+	}
+
+	model.Update(narrative)
+	if got := model.tasks[0].Narrative.Status; got != "generated" {
+		t.Fatalf("expected generated narrative status, got %q", got)
+	}
+	if !strings.Contains(model.detailContent(), "The generated review.") {
+		t.Fatalf("expected detail to render generated narrative, got:\n%s", model.detailContent())
 	}
 }
 

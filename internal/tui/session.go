@@ -118,6 +118,12 @@ type runDoneMsg struct {
 	err    error
 }
 
+type narrativeReadyMsg struct {
+	taskID int
+	body   string
+	err    error
+}
+
 type editorDoneMsg struct {
 	err error
 }
@@ -172,6 +178,13 @@ type chatEntry struct {
 	Time  time.Time
 }
 
+type RunNarrative struct {
+	Status  string
+	Body    string
+	Error   string
+	Updated time.Time
+}
+
 type taskRecord struct {
 	ID         int
 	Task       core.Task
@@ -181,6 +194,7 @@ type taskRecord struct {
 	RunErr     error
 	Status     string
 	Summary    string
+	Narrative  RunNarrative
 	StartedAt  time.Time
 	FinishedAt time.Time
 	Selected   int
@@ -363,6 +377,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.result = msg.result
 		m.runErr = msg.err
 		m.finishActiveTask(msg.result, msg.err)
+		if record := m.activeTaskRecord(); record != nil {
+			record.Narrative.Status = "pending"
+			record.Narrative.Updated = time.Now()
+			snapshot := m.runSnapshot(*record)
+			cmds = append(cmds, generateNarrativeCmd(m.parent, m.agent, record.ID, snapshot, record.Events))
+		}
 		if msg.err != nil {
 			m.status = "error: " + msg.err.Error()
 			m.setPhase(phaseError, msg.err.Error())
@@ -374,6 +394,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loop && m.approval == nil {
 			m.prepareTaskInput(true)
 			cmds = append(cmds, m.command.Focus())
+		}
+	case narrativeReadyMsg:
+		record := m.findTaskByID(msg.taskID)
+		if record != nil {
+			record.Narrative.Updated = time.Now()
+			if msg.err != nil {
+				record.Narrative.Status = "failed"
+				record.Narrative.Error = msg.err.Error()
+			} else {
+				record.Narrative.Status = "generated"
+				record.Narrative.Body = msg.body
+				record.Narrative.Error = ""
+			}
+			m.updateDetail()
 		}
 	case editorDoneMsg:
 		if msg.err != nil {
@@ -468,9 +502,18 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		m.view = viewDiff
 		m.focus = "detail"
 		m.updateDetail()
+	case "v":
+		m.view = viewTests
+		m.focus = "detail"
+		m.updateDetail()
 	case "s":
 		m.view = viewSteps
 		m.focus = "detail"
+		m.updateDetail()
+	case "x":
+		m.view = viewTrace
+		m.focus = "detail"
+		m.status = "trajectory: " + m.trajectoryPath()
 		m.updateDetail()
 	case "t":
 		m.showRun()
@@ -899,6 +942,15 @@ func (m *model) activeTaskRecord() *taskRecord {
 		return nil
 	}
 	return &m.tasks[m.activeTask]
+}
+
+func (m *model) findTaskByID(taskID int) *taskRecord {
+	for i := range m.tasks {
+		if m.tasks[i].ID == taskID {
+			return &m.tasks[i]
+		}
+	}
+	return nil
 }
 
 func (m *model) selectedEvents() []core.Event {
@@ -1425,11 +1477,7 @@ func (m *model) findTaskMatch(direction int) {
 }
 
 func (m *model) resize() {
-	bodyWidth := max(1, m.width-2)
-	bodyHeight := max(1, m.bodyHeight())
-	detailWidth := max(20, bodyWidth-m.sidebarWidth()-1)
-	m.detail.Width = detailWidth - 2
-	m.detail.Height = bodyHeight - 2
+	m.syncDetailSize()
 	m.help.Width = m.width
 	m.command.Width = max(10, m.width-18)
 	if m.sidebar == sidebarHistory {
@@ -1438,6 +1486,21 @@ func (m *model) resize() {
 		m.ensureChatVisible()
 	}
 	m.updateDetail()
+}
+
+func (m *model) syncDetailSize() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+	m.detail.Width = m.contentWidth()
+	m.detail.Height = max(1, m.bodyHeight()-2)
+}
+
+func (m *model) contentWidth() int {
+	if m.sidebar == sidebarHistory {
+		return max(20, m.width-m.sidebarWidth()-1) - 2
+	}
+	return max(20, m.width-2) - 2
 }
 
 func (m *model) bodyHeight() int {
@@ -1494,6 +1557,7 @@ func (m *model) sidebarListHeight() int {
 }
 
 func (m *model) updateDetail() {
+	m.syncDetailSize()
 	m.detail.SetContent(m.detailContent())
 }
 
@@ -1530,12 +1594,8 @@ func (m *model) detailContent() string {
 			}
 			return "No task history yet."
 		}
-		entries := m.selectedChat()
-		if m.selected >= 0 && m.selected < len(entries) {
-			return chatDetailWidth(entries[m.selected], m.detail.Width)
-		}
 		if record := m.selectedTaskRecord(); record != nil {
-			return finalReviewWidth(m.runSnapshot(*record), m.detail.Width)
+			return finalReviewWidth(*record, m.runSnapshot(*record), m.detail.Width)
 		}
 		if m.loop && !m.running {
 			return "Type a task below to start.\n\nSlash commands: /history, /clear, /quit, /help, /diff, /trace, /open-trace."
@@ -1658,7 +1718,16 @@ func (m *model) artifactBar() string {
 }
 
 func (m *model) bodyView() string {
+	m.syncDetailSize()
 	bodyHeight := m.bodyHeight()
+	if m.sidebar != sidebarHistory {
+		return panelStyle.
+			Width(max(20, m.width-2)).
+			Height(bodyHeight).
+			BorderForeground(focusColor(m.focus == "detail")).
+			Render(m.detail.View())
+	}
+
 	sidebarWidth := m.sidebarWidth()
 	detailWidth := max(20, m.width-sidebarWidth-1)
 
@@ -2240,7 +2309,17 @@ func stepsViewWidth(snapshot RunSnapshot, width int) string {
 	return b.String()
 }
 
-func finalReviewWidth(snapshot RunSnapshot, width int) string {
+func finalReviewWidth(record taskRecord, snapshot RunSnapshot, width int) string {
+	if body := strings.TrimSpace(record.Narrative.Body); body != "" {
+		return "Review\n\n" + wrapText(body, width) + "\n"
+	}
+	if record.Narrative.Status == "pending" {
+		return fallbackReviewWidth(snapshot, width) + "\nGenerating review...\n"
+	}
+	return fallbackReviewWidth(snapshot, width)
+}
+
+func fallbackReviewWidth(snapshot RunSnapshot, width int) string {
 	var b strings.Builder
 	b.WriteString("Review\n")
 	writeField(&b, "Status", snapshot.FinalReview.Status, width)
@@ -2277,9 +2356,9 @@ func finalReviewWidth(snapshot RunSnapshot, width int) string {
 	writeSection(&b, "Actions")
 	for _, action := range []string{
 		"d inspect diff",
-		":tests inspect validation",
+		"v inspect validation",
 		"s inspect steps",
-		":trace inspect trace",
+		"x inspect trace",
 		"i new task",
 		"q quit",
 	} {
@@ -2775,11 +2854,11 @@ var (
 	keyCommand        = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
 	keyHelp           = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
 	keyDiff           = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
-	keyTests          = key.NewBinding(key.WithKeys(":tests"), key.WithHelp(":tests", "validation"))
+	keyTests          = key.NewBinding(key.WithKeys("v", ":tests"), key.WithHelp("v", "validation"))
 	keySteps          = key.NewBinding(key.WithKeys("s", ":steps"), key.WithHelp("s", "steps"))
 	keyTimeline       = key.NewBinding(key.WithKeys("t", ":overview"), key.WithHelp("t", "overview"))
 	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
-	keyTrace          = key.NewBinding(key.WithKeys(":trace"), key.WithHelp(":trace", "trace path"))
+	keyTrace          = key.NewBinding(key.WithKeys("x", ":trace"), key.WithHelp("x", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
 	keySlashHistory   = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
 	keySlashClear     = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
