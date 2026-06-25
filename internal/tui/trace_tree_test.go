@@ -71,6 +71,102 @@ func TestTraceTreeCollapseHidesChildren(t *testing.T) {
 	}
 }
 
+func TestTraceNarrativeBuildsVisiblePlanActionObservation(t *testing.T) {
+	record := taskRecord{
+		Task: core.Task{Text: "review current code", Repo: "/repo"},
+		Events: []core.Event{
+			{Type: "user_task", Data: map[string]any{"task": "review current code", "repo": "/repo"}},
+			{Type: "model_response", Data: map[string]any{
+				"step":    1,
+				"content": "I will inspect the repository before answering.\n```shell\nrg --files\n```",
+			}},
+			{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "rg --files"}}},
+			{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 0, "output_preview": "internal/tui/trace_tree.go\n"}},
+		},
+	}
+
+	tree := buildTraceTreeVM(buildTraceNarrativeNodes(record, problemtrace.Replay(record.Events)))
+	rows := flattenTraceTree(tree, map[string]bool{
+		"node-root":        true,
+		"node-step-1-note": true,
+		"node-action-2":    true,
+	})
+	got := renderTraceTreeASCII(rows, traceWorkspaceState{Cursor: 1}, 120)
+
+	for _, want := range []string{
+		"Step 1: AI plan",
+		"I will inspect the repository before answering.",
+		"shell: rg --files",
+		"command succeeded",
+		"reason",
+		"action",
+		"observation",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected narrative tree to contain %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "```") {
+		t.Fatalf("expected fenced tool block to be stripped from visible note, got:\n%s", got)
+	}
+}
+
+func TestTraceNarrativeHidesPromptSnapshotsUnlessDebug(t *testing.T) {
+	record := taskRecord{
+		Task: core.Task{Text: "fix it", Repo: "/repo"},
+		Events: []core.Event{
+			{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}},
+			{Type: "prompt_snapshot", Data: map[string]any{"snapshot": problemtrace.PromptSnapshot{
+				ID:           "prompt-1",
+				Step:         1,
+				MessageCount: 3,
+				ToolCount:    1,
+			}}},
+		},
+	}
+
+	compact := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabTrace}, 100, "trace.jsonl")
+	if strings.Contains(compact, "Prompt snapshot 1") {
+		t.Fatalf("expected compact trace to hide prompt snapshots, got:\n%s", compact)
+	}
+
+	debug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabTrace, Debug: true, Expanded: map[string]bool{"node-root": true}}, 100, "trace.jsonl")
+	if !strings.Contains(debug, "Prompt snapshot 1") || !strings.Contains(debug, "prompt") {
+		t.Fatalf("expected debug trace to show raw prompt snapshot, got:\n%s", debug)
+	}
+}
+
+func TestTraceNarrativeCompactsRepeatedEvidence(t *testing.T) {
+	trace := problemtrace.ProblemTrace{
+		Problem: problemtrace.ProblemContext{UserTask: "inspect repo"},
+		Directions: []problemtrace.InvestigationDirection{{
+			ID:         "dir-collect-current-repository-evidence",
+			Hypothesis: "Collect current repository evidence",
+			Rationale:  "Tool observations should be interpreted before patching.",
+			Status:     problemtrace.DirectionSupported,
+			SupportingEvidence: []problemtrace.Evidence{
+				{ID: "evidence-1", Summary: "shell observation captured", Detail: "first output", EventIDs: []int{1}},
+				{ID: "evidence-2", Summary: "shell observation captured", Detail: "second output", EventIDs: []int{2}},
+			},
+		}},
+	}
+	record := taskRecord{Task: core.Task{Text: "inspect repo", Repo: "/repo"}}
+
+	tree := buildTraceTreeVM(buildTraceNarrativeNodes(record, trace))
+	rows := flattenTraceTree(tree, map[string]bool{
+		"node-root": true,
+		"node-dir-collect-current-repository-evidence": true,
+	})
+	got := renderTraceTreeASCII(rows, traceWorkspaceState{Cursor: 2}, 120)
+
+	if !strings.Contains(got, "shell observations captured x2") {
+		t.Fatalf("expected repeated evidence to be grouped, got:\n%s", got)
+	}
+	if strings.Count(got, "shell observation captured") > 1 {
+		t.Fatalf("expected repeated evidence to appear once, got:\n%s", got)
+	}
+}
+
 func TestTraceCursorMovesWithinRows(t *testing.T) {
 	m := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	m.detail.Width = 100

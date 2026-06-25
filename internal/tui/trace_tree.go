@@ -55,6 +55,9 @@ var (
 	traceDirectionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
 	traceEvidenceStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	tracePromptStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("177"))
+	traceThoughtStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
+	traceActionStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	traceObserveStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	traceMemoryStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	traceEventStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	traceFixStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)
@@ -74,7 +77,11 @@ func buildTraceWorkspaceVM(record taskRecord, state traceWorkspaceState, traject
 	state.ensureDefaults()
 
 	trace := problemtrace.Replay(record.Events)
-	tree := buildTraceTreeVM(trace.History)
+	nodes := trace.History
+	if !state.Debug {
+		nodes = buildTraceNarrativeNodes(record, trace)
+	}
+	tree := buildTraceTreeVM(nodes)
 	rows := flattenTraceTree(tree, state.Expanded)
 
 	var selected *TraceTreeNodeVM
@@ -216,7 +223,7 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 	trace := vm.Trace
 	snapshot := BuildRunSnapshot(record, vm.TrajectoryPath)
 	writeField(b, "Task", shortString(trace.Problem.UserTask, 120), width)
-	writeField(b, "Status", traceRunStatus(record), width)
+	writeField(b, "Status", narrativeRunStatus(record, trace), width)
 	writeField(b, "Validation", validationSummary(snapshot), width)
 	if snapshot.FinalReview.ChangedFiles > 0 {
 		writeField(b, "Diff", fmt.Sprintf("%d files changed", snapshot.FinalReview.ChangedFiles), width)
@@ -300,21 +307,34 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int, debug bool) string {
 	var b strings.Builder
 	b.WriteString("Selected\n")
-	writeField(&b, "Status", node.Status, width)
-	switch displayTraceKindLabel(node.Kind, node.ID, node.Title) {
-	case "direction", "observation":
+	switch strings.ToLower(strings.TrimSpace(node.Kind)) {
+	case "thought":
+		writeField(&b, "AI said", node.Summary, width)
+	case "action":
+		writeField(&b, "Action", displayTraceNodeTitle(node), width)
+		writeField(&b, "Why", node.Summary, width)
+	case "observation":
+		writeField(&b, "Observation", displayTraceNodeTitle(node), width)
+		writeField(&b, "Result", node.Summary, width)
+	case "direction":
 		writeField(&b, "Direction", displayTraceNodeTitle(node), width)
+		writeField(&b, "Why", node.Summary, width)
 	case "evidence":
 		writeField(&b, "Evidence", displayTraceNodeTitle(node), width)
+		writeField(&b, "Detail", node.Summary, width)
 	case "symptom":
 		writeField(&b, "Symptom", displayTraceNodeTitle(node), width)
+		writeField(&b, "Evidence", node.Summary, width)
 	case "prompt":
 		writeField(&b, "Prompt", displayTraceNodeTitle(node), width)
+	case "task", "problem":
+		writeField(&b, "What", displayTraceNodeTitle(node), width)
+		writeField(&b, "Why", node.Summary, width)
 	default:
 		writeField(&b, "Item", displayTraceNodeTitle(node), width)
-	}
-	if node.Summary != "" {
-		writeField(&b, "Why", node.Summary, width)
+		if node.Summary != "" {
+			writeField(&b, "Why", node.Summary, width)
+		}
 	}
 	if !debug {
 		return b.String()
@@ -323,6 +343,7 @@ func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int,
 	writeSection(&b, "Debug")
 	writeField(&b, "ID", node.ID, width)
 	writeField(&b, "Kind", node.Kind, width)
+	writeField(&b, "Status", node.Status, width)
 	if displayTraceNodeTitle(node) != node.Title {
 		writeField(&b, "Title", node.Title, width)
 	}
@@ -343,11 +364,6 @@ func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int,
 		writeField(&b, "Children", len(node.Children), width)
 	}
 	return b.String()
-}
-
-func traceRunStatus(record taskRecord) string {
-	status := valueOrDefault(record.Status, record.Result.Status)
-	return valueOrDefault(status, "pending")
 }
 
 func displayTraceRowTitle(row TraceTreeRow) string {
@@ -425,7 +441,7 @@ func traceNodeLineStyle(kind string, status string, selected bool) lipgloss.Styl
 	}
 
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "problem":
+	case "task", "problem":
 		return traceProblemStyle
 	case "direction":
 		return traceDirectionStyle
@@ -433,6 +449,12 @@ func traceNodeLineStyle(kind string, status string, selected bool) lipgloss.Styl
 		return traceEvidenceStyle
 	case "prompt":
 		return tracePromptStyle
+	case "thought":
+		return traceThoughtStyle
+	case "action":
+		return traceActionStyle
+	case "observation":
+		return traceObserveStyle
 	case "memory", "card":
 		return traceMemoryStyle
 	case "events", "event":
@@ -446,10 +468,18 @@ func traceNodeLineStyle(kind string, status string, selected bool) lipgloss.Styl
 
 func traceKindLabel(kind string) string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "task":
+		return "task"
 	case "problem":
 		return "problem"
 	case "prompt":
 		return "prompt"
+	case "thought":
+		return "reason"
+	case "action":
+		return "action"
+	case "observation":
+		return "observation"
 	case "direction":
 		return "direction"
 	case "evidence":

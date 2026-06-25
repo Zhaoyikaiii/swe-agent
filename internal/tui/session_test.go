@@ -389,17 +389,18 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Problem Trace Workspace",
 		"[1 Trace]  2 Next  3 Memory  4 Events  5 Prompt  6 Learn",
 		"Task: fix go test import cycle",
+		"Status: running",
 		"Validation: not recorded",
 		"Active: Resolve the Go import cycle",
 		"Symptom: Go compile failed with import cycle not allowed: go test ./...",
 		"Trace Tree",
-		"> [-] * Problem  problem  running",
+		"> [-] * Task  task  running",
 		"+-- [ ] + Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
 		"+-- [-] + Resolve the Go import cycle  direction  supported",
 		"|   `-- [ ] + package service imports handler and handler imports service  evidence  supports",
-		"+-- [ ] + Prompt snapshot 1  prompt  captured",
+		"`-- [ ] * Review  verify  running",
 		"Selected",
-		"Item: Problem",
+		"What: Task",
 		"Why: fix go test import cycle",
 	} {
 		if !strings.Contains(rendered, want) {
@@ -407,6 +408,7 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		}
 	}
 	for _, unwanted := range []string{
+		"Prompt snapshot 1",
 		"Trace ID:",
 		"Trajectory:",
 		"Repository:",
