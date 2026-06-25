@@ -137,7 +137,8 @@ const (
 type detailView int
 
 const (
-	viewEvent detailView = iota
+	viewOverview detailView = iota
+	viewSteps
 	viewDiff
 	viewTests
 	viewTrace
@@ -146,7 +147,7 @@ const (
 type sidebarMode int
 
 const (
-	sidebarChat sidebarMode = iota
+	sidebarRun sidebarMode = iota
 	sidebarHistory
 )
 
@@ -278,8 +279,8 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, parent conte
 		task:         task,
 		parent:       parent,
 		mode:         modeNormal,
-		view:         viewEvent,
-		sidebar:      sidebarChat,
+		view:         viewOverview,
+		sidebar:      sidebarRun,
 		focus:        "sidebar",
 		nextTaskID:   1,
 		activeTask:   -1,
@@ -352,7 +353,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeApproval
 		m.status = fmt.Sprintf("approval required: %s (%s)", msg.request.Call.Name, msg.request.Risk)
 		m.setPhase(phaseApproval, fmt.Sprintf("%s requires %s approval", msg.request.Call.Name, msg.request.Risk))
-		m.view = viewEvent
+		m.view = viewOverview
 		m.updateDetail()
 		cmds = append(cmds, waitForApproval(m.session.approvals))
 	case runDoneMsg:
@@ -445,7 +446,7 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		m.focus = "detail"
 	case "enter":
 		if m.sidebar == sidebarHistory && m.focus == "sidebar" {
-			m.showChat()
+			m.showRun()
 			return nil
 		}
 		m.focus = "detail"
@@ -467,8 +468,12 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		m.view = viewDiff
 		m.focus = "detail"
 		m.updateDetail()
+	case "s":
+		m.view = viewSteps
+		m.focus = "detail"
+		m.updateDetail()
 	case "t":
-		m.showChat()
+		m.showRun()
 	case "o":
 		m.focus = "detail"
 	case "g", "z":
@@ -674,8 +679,12 @@ func (m *model) executeCommand(command string) tea.Cmd {
 		m.view = viewTests
 		m.focus = "detail"
 		m.updateDetail()
-	case "t", "timeline", "events", "chat":
-		m.showChat()
+	case "s", "steps":
+		m.view = viewSteps
+		m.focus = "detail"
+		m.updateDetail()
+	case "t", "timeline", "events", "chat", "run", "overview":
+		m.showRun()
 	case "clear":
 		m.clearSession()
 	case "history", "tasks":
@@ -712,8 +721,12 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 		m.view = viewTests
 		m.focus = "detail"
 		m.updateDetail()
-	case "t", "timeline", "events", "chat":
-		m.showChat()
+	case "s", "steps":
+		m.view = viewSteps
+		m.focus = "detail"
+		m.updateDetail()
+	case "t", "timeline", "events", "chat", "run", "overview":
+		m.showRun()
 	case "history", "tasks":
 		m.showHistory()
 	case "trace":
@@ -777,8 +790,8 @@ func (m *model) startRun(task core.Task) tea.Cmd {
 	m.setSelectedTask(taskIndex)
 	m.mode = modeNormal
 	m.command.Blur()
-	m.view = viewEvent
-	m.sidebar = sidebarChat
+	m.view = viewOverview
+	m.sidebar = sidebarRun
 	m.focus = "sidebar"
 	m.status = "running task: " + shortString(task.Text, 48)
 	m.setPhase(phaseThinking, "preparing task")
@@ -803,8 +816,8 @@ func (m *model) clearSession() {
 	m.done = false
 	m.query = ""
 	m.pendingKey = ""
-	m.view = viewEvent
-	m.sidebar = sidebarChat
+	m.view = viewOverview
+	m.sidebar = sidebarRun
 	m.focus = "sidebar"
 	m.detail.GotoTop()
 	m.drainEvents()
@@ -946,13 +959,13 @@ func (m *model) setSelectedTask(index int) {
 		m.chatOffset = 0
 		return
 	}
-	steps := m.selectedSteps()
-	if record.Selected < 0 || len(steps) == 0 {
+	entries := record.Chat
+	if record.Selected < 0 || len(entries) == 0 {
 		m.selected = -1
 		m.chatOffset = max(0, record.ChatOffset)
 		return
 	}
-	m.selected = clamp(record.Selected, 0, len(steps)-1)
+	m.selected = clamp(record.Selected, 0, len(entries)-1)
 	m.chatOffset = max(0, record.ChatOffset)
 	m.ensureChatVisible()
 }
@@ -1043,54 +1056,6 @@ func (m *model) updateTaskChat(record *taskRecord, event core.Event) {
 			Body:  body,
 			Time:  event.Time,
 		})
-	case "model_response":
-		body := strings.TrimSpace(fmt.Sprint(event.Data["content"]))
-		if body == "" {
-			return
-		}
-		record.Chat = append(record.Chat, chatEntry{
-			Role:  "assistant",
-			Title: "Agent",
-			Body:  body,
-			Time:  event.Time,
-		})
-	case "tool_call":
-		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
-		if toolName == "" {
-			toolName = "tool"
-		}
-		body := "Running " + toolName
-		if args, ok := event.Data["args"]; ok {
-			if formatted := strings.TrimSpace(formatArgsMap(args)); formatted != "" && formatted != "empty" {
-				body += "\n\n" + formatted
-			}
-		}
-		record.Chat = append(record.Chat, chatEntry{
-			Role:  "tool",
-			Title: "Tool",
-			Body:  body,
-			Time:  event.Time,
-		})
-	case "tool_result":
-		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
-		if toolName == "" {
-			toolName = "tool"
-		}
-		code := strings.TrimSpace(fmt.Sprint(event.Data["code"]))
-		status := "ok"
-		if code != "" && code != "0" && code != "<nil>" {
-			status = "exit " + code
-		}
-		body := fmt.Sprintf("%s finished: %s", toolName, status)
-		if output := strings.TrimSpace(fmt.Sprint(event.Data["output"])); output != "" && output != "<nil>" {
-			body += "\n\n" + output
-		}
-		record.Chat = append(record.Chat, chatEntry{
-			Role:  "result",
-			Title: "Result",
-			Body:  body,
-			Time:  event.Time,
-		})
 	case "tool_denied":
 		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
 		if toolName == "" {
@@ -1101,8 +1066,8 @@ func (m *model) updateTaskChat(record *taskRecord, event core.Event) {
 			body += "\n\n" + reason
 		}
 		record.Chat = append(record.Chat, chatEntry{
-			Role:  "denied",
-			Title: "Denied",
+			Role:  "attention",
+			Title: "Attention",
 			Body:  body,
 			Time:  event.Time,
 		})
@@ -1112,8 +1077,8 @@ func (m *model) updateTaskChat(record *taskRecord, event core.Event) {
 			return
 		}
 		record.Chat = append(record.Chat, chatEntry{
-			Role:  "error",
-			Title: "Error",
+			Role:  "attention",
+			Title: "Attention",
 			Body:  body,
 			Time:  event.Time,
 		})
@@ -1128,7 +1093,7 @@ func (m *model) finishActiveTask(result agentpkg.Result, err error) {
 	if record == nil {
 		return
 	}
-	wasViewingTask := m.activeTask == m.selectedTask && m.sidebar == sidebarChat
+	wasViewingTask := m.activeTask == m.selectedTask && m.sidebar == sidebarRun
 	follow := wasViewingTask && (m.selected == len(record.Chat)-1 || m.selected < 0)
 	record.Result = result
 	record.RunErr = err
@@ -1155,12 +1120,12 @@ func (m *model) addEvent(event core.Event) {
 	taskIndex := m.ensureEventTask(event)
 	record := &m.tasks[taskIndex]
 	wasViewingTask := taskIndex == m.selectedTask
-	follow := wasViewingTask && m.sidebar == sidebarChat && (m.selected == len(record.Chat)-1 || m.selected < 0)
+	follow := wasViewingTask && m.sidebar == sidebarRun && (m.selected == len(record.Chat)-1 || m.selected < 0)
 	record.Events = append(record.Events, event)
 	m.updateTaskFromEvent(record, event)
 	m.updateTaskChat(record, event)
 
-	if wasViewingTask && m.sidebar == sidebarChat {
+	if wasViewingTask && m.sidebar == sidebarRun {
 		if event.Type == "final" {
 			m.selected = -1
 			m.saveSelectedTaskView()
@@ -1173,8 +1138,8 @@ func (m *model) addEvent(event core.Event) {
 	} else if wasViewingTask {
 		m.updateDetail()
 	}
-	m.status = summarizeEvent(event)
 	m.updatePhaseFromEvent(event)
+	m.status = summarizeEvent(event)
 }
 
 func (m *model) setPhase(phase runPhase, hint string) {
@@ -1271,16 +1236,16 @@ func (m *model) moveSelection(delta int) {
 	if m.sidebar == sidebarHistory {
 		m.moveTaskSelection(delta)
 	} else {
-		m.moveChatSelection(delta)
+		m.moveRunSelection(delta)
 	}
 }
 
-func (m *model) moveChatSelection(delta int) {
-	steps := m.selectedSteps()
-	if len(steps) == 0 {
+func (m *model) moveRunSelection(delta int) {
+	entries := m.selectedChat()
+	if len(entries) == 0 {
 		return
 	}
-	m.selectIndex(clamp(m.selected+delta, 0, len(steps)-1))
+	m.selectIndex(clamp(m.selected+delta, 0, len(entries)-1))
 }
 
 func (m *model) moveTaskSelection(delta int) {
@@ -1291,14 +1256,14 @@ func (m *model) moveTaskSelection(delta int) {
 }
 
 func (m *model) selectIndex(index int) {
-	steps := m.selectedSteps()
-	if len(steps) == 0 {
+	entries := m.selectedChat()
+	if len(entries) == 0 {
 		m.selected = -1
 		m.saveSelectedTaskView()
 		m.updateDetail()
 		return
 	}
-	m.selected = clamp(index, 0, len(steps)-1)
+	m.selected = clamp(index, 0, len(entries)-1)
 	m.ensureChatVisible()
 	m.saveSelectedTaskView()
 	m.updateDetail()
@@ -1330,7 +1295,7 @@ func (m *model) selectLast() {
 		m.selectTaskIndex(len(m.tasks) - 1)
 		return
 	}
-	m.selectIndex(len(m.selectedSteps()) - 1)
+	m.selectIndex(len(m.selectedChat()) - 1)
 }
 
 func (m *model) centerSelection() {
@@ -1360,7 +1325,7 @@ func (m *model) toggleFocus() {
 
 func (m *model) showHistory() {
 	m.sidebar = sidebarHistory
-	m.view = viewEvent
+	m.view = viewOverview
 	m.focus = "sidebar"
 	if len(m.tasks) > 0 && m.selectedTask < 0 {
 		m.setSelectedTask(len(m.tasks) - 1)
@@ -1372,9 +1337,9 @@ func (m *model) showHistory() {
 	m.updateDetail()
 }
 
-func (m *model) showChat() {
-	m.sidebar = sidebarChat
-	m.view = viewEvent
+func (m *model) showRun() {
+	m.sidebar = sidebarRun
+	m.view = viewOverview
 	m.focus = "sidebar"
 	if len(m.tasks) > 0 && m.selectedTask < 0 {
 		m.setSelectedTask(len(m.tasks) - 1)
@@ -1382,7 +1347,7 @@ func (m *model) showChat() {
 	m.ensureChatVisible()
 	m.mode = modeNormal
 	m.command.Blur()
-	m.status = "chat for selected task"
+	m.status = "run overview"
 	m.updateDetail()
 }
 
@@ -1411,13 +1376,13 @@ func (m *model) findMatch(direction int) {
 		m.findTaskMatch(direction)
 		return
 	}
-	m.findChatMatch(direction)
+	m.findRunMatch(direction)
 }
 
-func (m *model) findChatMatch(direction int) {
-	steps := m.selectedSteps()
-	if len(steps) == 0 {
-		m.status = "no steps to search"
+func (m *model) findRunMatch(direction int) {
+	entries := m.selectedChat()
+	if len(entries) == 0 {
+		m.status = "no run summary to search"
 		return
 	}
 	needle := strings.ToLower(m.query)
@@ -1425,9 +1390,9 @@ func (m *model) findChatMatch(direction int) {
 	if start < 0 {
 		start = 0
 	}
-	for i := 1; i <= len(steps); i++ {
-		idx := (start + direction*i + len(steps)*2) % len(steps)
-		haystack := strings.ToLower(stepLine(steps[idx]) + "\n" + stepDetailWidth(steps[idx], m.detail.Width))
+	for i := 1; i <= len(entries); i++ {
+		idx := (start + direction*i + len(entries)*2) % len(entries)
+		haystack := strings.ToLower(chatLine(entries[idx]) + "\n" + chatDetailWidth(entries[idx], m.detail.Width))
 		if strings.Contains(haystack, needle) {
 			m.selectIndex(idx)
 			m.status = fmt.Sprintf("match %d: %s", idx+1, m.query)
@@ -1534,6 +1499,11 @@ func (m *model) updateDetail() {
 
 func (m *model) detailContent() string {
 	switch m.view {
+	case viewSteps:
+		if record := m.selectedTaskRecord(); record != nil {
+			return stepsViewWidth(m.runSnapshot(*record), m.detail.Width)
+		}
+		return "No steps recorded."
 	case viewDiff:
 		result := m.selectedResult()
 		if result.Diff != "" {
@@ -1560,9 +1530,9 @@ func (m *model) detailContent() string {
 			}
 			return "No task history yet."
 		}
-		steps := m.selectedSteps()
-		if m.selected >= 0 && m.selected < len(steps) {
-			return stepDetailWidth(steps[m.selected], m.detail.Width)
+		entries := m.selectedChat()
+		if m.selected >= 0 && m.selected < len(entries) {
+			return chatDetailWidth(entries[m.selected], m.detail.Width)
 		}
 		if record := m.selectedTaskRecord(); record != nil {
 			return finalReviewWidth(m.runSnapshot(*record), m.detail.Width)
@@ -1615,7 +1585,7 @@ func (m *model) headerView() string {
 	left := fmt.Sprintf(" swe-agent  %s %s  %s ", indicator, m.phaseLabel(), taskLabel)
 	right := fmt.Sprintf(" %s  %s  %s ", m.profileLabel(), m.modelLabel(), elapsed)
 	if m.done {
-		right = fmt.Sprintf(" %s  steps %d  %s ", m.profileLabel(), m.result.Steps, elapsed)
+		right = fmt.Sprintf(" %s  %s ", m.profileLabel(), elapsed)
 	}
 	header := headerStyle.Width(m.width).Render(fillLine(left, right, m.width))
 	return lipgloss.JoinVertical(lipgloss.Left, header, artifactBarStyle.Width(m.width).Render(m.artifactBar()))
@@ -1659,7 +1629,7 @@ func (m *model) profileLabel() string {
 func (m *model) artifactBar() string {
 	record := m.selectedTaskRecord()
 	if record == nil {
-		return " Files 0   Diff none   Tests 0/0   Approvals 0   Trace no "
+		return " Files 0   Diff none   Tests unknown   Approvals 0   Trace no "
 	}
 	snapshot := m.runSnapshot(*record)
 	diffState := "none"
@@ -1674,11 +1644,14 @@ func (m *model) artifactBar() string {
 	if m.approval != nil {
 		approvals = 1
 	}
-	return fmt.Sprintf(" Files %d   Diff %s   Tests %d/%d   Approvals %d   Trace %s ",
+	tests := "unknown"
+	if snapshot.FinalReview.TestsRun > 0 {
+		tests = fmt.Sprintf("%d/%d", snapshot.FinalReview.TestsPassed, snapshot.FinalReview.TestsRun)
+	}
+	return fmt.Sprintf(" Files %d   Diff %s   Tests %s   Approvals %d   Trace %s ",
 		snapshot.FinalReview.ChangedFiles,
 		diffState,
-		snapshot.FinalReview.TestsPassed,
-		snapshot.FinalReview.TestsRun,
+		tests,
 		approvals,
 		traceState,
 	)
@@ -1724,21 +1697,21 @@ func (m *model) sidebarView(width, height int) string {
 	if m.sidebar == sidebarHistory {
 		return m.historyView(width, height)
 	}
-	return m.chatView(width, height)
+	return m.runSidebarView(width, height)
 }
 
-func (m *model) chatView(width, height int) string {
-	title := "Mission / Steps"
+func (m *model) runSidebarView(width, height int) string {
+	title := "Run"
 	if record := m.selectedTaskRecord(); record != nil {
-		title = fmt.Sprintf("Task #%d steps", record.ID)
+		title = fmt.Sprintf("Run #%d", record.ID)
 	}
 	if height <= 0 {
 		return ""
 	}
 	lines := []string{sidebarTitleStyle.Render(truncate(title, width))}
 	listHeight := max(0, height-1)
-	steps := m.selectedSteps()
-	if len(steps) == 0 {
+	entries := m.selectedChat()
+	if len(entries) == 0 {
 		message := "Waiting for agent activity..."
 		if m.loop && !m.running {
 			message = "Enter a task below."
@@ -1749,7 +1722,7 @@ func (m *model) chatView(width, height int) string {
 		}
 		return strings.Join(lines, "\n")
 	}
-	end := min(len(steps), m.chatOffset+listHeight)
+	end := min(len(entries), m.chatOffset+listHeight)
 	for i := m.chatOffset; i < end; i++ {
 		prefix := "  "
 		style := sidebarItemStyle
@@ -1757,7 +1730,7 @@ func (m *model) chatView(width, height int) string {
 			prefix = "> "
 			style = selectedStyle
 		}
-		lines = append(lines, style.Render(truncate(prefix+stepLine(steps[i]), width)))
+		lines = append(lines, style.Render(truncate(prefix+chatLine(entries[i]), width)))
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
@@ -1850,7 +1823,7 @@ func (m *model) fullHelp() [][]key.Binding {
 		{keyMove, keyLeftRight, keyTop, keyBottom, keyCenter},
 		{keyScrollHalf, keyScrollPage, keyTab, keyOpen},
 		{keySearch, keyNext, keyPrev, keyCommand, keyHelp},
-		{keyDiff, keyTests, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
+		{keyDiff, keyTests, keySteps, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
 		{keyTaskInput, keySlashHistory, keySlashClear, keySlashQuit},
 		{keyAllow, keyDeny, keyRemember, keyExpandApproval},
 		{keyQuit, keyCancel},
@@ -1860,24 +1833,35 @@ func (m *model) fullHelp() [][]key.Binding {
 func summarizeEvent(event core.Event) string {
 	switch event.Type {
 	case "user_task":
-		return "task " + shortString(event.Data["task"], 48)
+		return "Task started: " + shortString(event.Data["task"], 48)
 	case "model_request":
-		return fmt.Sprintf("model_request step=%v messages=%v", event.Data["step"], event.Data["messages"])
+		return "Waiting for model"
 	case "model_response":
-		return "model_response " + shortString(event.Data["content"], 48)
+		return "Planning next action"
 	case "tool_call":
-		return fmt.Sprintf("tool_call %v", event.Data["tool"])
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "command"
+		}
+		return "Running " + toolName
 	case "tool_result":
-		return fmt.Sprintf("tool_result %v code=%v", event.Data["tool"], event.Data["code"])
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "Command"
+		}
+		if code := intValue(event.Data["code"]); code != 0 {
+			return fmt.Sprintf("%s failed: exit %d", toolName, code)
+		}
+		return toolName + " finished"
 	case "tool_denied":
-		return fmt.Sprintf("tool_denied %v", event.Data["tool"])
+		return fmt.Sprintf("%v denied", event.Data["tool"])
 	case "error":
-		return "error " + shortString(event.Data["error"], 48)
+		return "Error: " + shortString(event.Data["error"], 48)
 	case "final":
-		return fmt.Sprintf("final status=%v steps=%v", event.Data["status"], event.Data["steps"])
+		return "Finished: " + strings.TrimSpace(fmt.Sprint(event.Data["status"]))
 	default:
 		if event.Type == "" {
-			return "event"
+			return "Working"
 		}
 		return event.Type
 	}
@@ -1970,11 +1954,13 @@ func chatRoleLabel(entry chatEntry) string {
 	case "result":
 		return "Result"
 	case "denied":
-		return "Denied"
+		return "Attention"
+	case "attention":
+		return "Attention"
 	case "error":
-		return "Error"
+		return "Attention"
 	case "summary":
-		return "Summary"
+		return "Outcome"
 	default:
 		return valueOrDefault(entry.Title, valueOrDefault(entry.Role, "Message"))
 	}
@@ -2000,31 +1986,45 @@ func chatDetailWidth(entry chatEntry, width int) string {
 
 func taskSummary(record taskRecord) string {
 	status := valueOrDefault(record.Status, "pending")
-	steps := record.Result.Steps
-	if steps == 0 {
-		steps = intValue(lastEventData(record.Events, "final", "steps"))
-	}
 	conclusion := taskConclusion(record)
 	errText := strings.TrimSpace(lastErrorText(record))
-	stepText := "without any recorded steps"
-	if steps == 1 {
-		stepText = "after 1 step"
-	} else if steps > 1 {
-		stepText = fmt.Sprintf("after %d steps", steps)
-	}
 
 	switch {
-	case errText != "":
-		return fmt.Sprintf("Task finished with status %s %s. Error: %s", status, stepText, errText)
-	case conclusion != "":
-		return fmt.Sprintf("Task finished with status %s %s. Agent summary: %s", status, stepText, conclusion)
-	case record.Result.Diff != "":
-		return fmt.Sprintf("Task finished with status %s %s. A workspace diff is available; press d to inspect it.", status, stepText)
 	case status == "running":
-		return "Task is still running. The agent summary will appear here when it finishes."
+		return "Running.\n\nSummary:\n  Waiting for result.\n\nEvidence:\n  Diff: pending\n  Tests: unknown"
+	case errText != "":
+		return fmt.Sprintf("%s.\n\nNeed attention:\n  %s", titleStatus(status), errText)
+	case conclusion != "":
+		return fmt.Sprintf("%s.\n\nSummary:\n  %s\n\nEvidence:\n%s", titleStatus(status), conclusion, indentText(taskEvidence(record), 2))
+	case record.Result.Diff != "":
+		return fmt.Sprintf("%s.\n\nSummary:\n  No final summary recorded.\n\nEvidence:\n%s", titleStatus(status), indentText(taskEvidence(record), 2))
 	default:
-		return fmt.Sprintf("Task finished with status %s %s. No final summary text was submitted.", status, stepText)
+		return fmt.Sprintf("%s.\n\nSummary:\n  No final summary recorded.\n\nEvidence:\n%s", titleStatus(status), indentText(taskEvidence(record), 2))
 	}
+}
+
+func titleStatus(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return "Done"
+	}
+	return strings.ToUpper(status[:1]) + status[1:]
+}
+
+func taskEvidence(record taskRecord) string {
+	snapshot := BuildRunSnapshot(record, record.Result.TrajectoryPath)
+	diff := "not available"
+	if snapshot.FinalReview.ChangedFiles > 0 || record.Result.Diff != "" {
+		diff = fmt.Sprintf("%d files changed", snapshot.FinalReview.ChangedFiles)
+		if snapshot.FinalReview.ChangedFiles == 0 {
+			diff = "available"
+		}
+	}
+	tests := "not recorded"
+	if snapshot.FinalReview.TestsRun > 0 {
+		tests = fmt.Sprintf("%d/%d passed", snapshot.FinalReview.TestsPassed, snapshot.FinalReview.TestsRun)
+	}
+	return fmt.Sprintf("Diff: %s\nTests: %s", diff, tests)
 }
 
 func taskConclusion(record taskRecord) string {
@@ -2135,6 +2135,7 @@ func taskHistoryLine(record taskRecord) string {
 }
 
 func taskDetailWidth(record taskRecord, width int) string {
+	snapshot := BuildRunSnapshot(record, record.Result.TrajectoryPath)
 	var b strings.Builder
 	fmt.Fprintf(&b, "Task #%d\n", record.ID)
 	writeField(&b, "Status", valueOrDefault(record.Status, "pending"), width)
@@ -2149,40 +2150,31 @@ func taskDetailWidth(record taskRecord, width int) string {
 	if duration := taskDuration(record); duration != "" {
 		writeField(&b, "Duration", duration, width)
 	}
-	if summary := strings.TrimSpace(record.Summary); summary != "" {
-		writeSection(&b, "Summary")
+	if summary := strings.TrimSpace(taskConclusion(record)); summary != "" {
+		writeSection(&b, "Outcome")
 		b.WriteString(wrapText(summary, width))
 		b.WriteByte('\n')
 	}
 
-	writeSection(&b, "Result")
-	if record.Result.Status == "" && record.Result.Steps == 0 && record.RunErr == nil {
-		b.WriteString("No result yet.\n")
-	} else {
-		writeField(&b, "Status", record.Result.Status, width)
-		writeField(&b, "Steps", record.Result.Steps, width)
-		if usage := record.Result.Usage; usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.CostUSD != 0 {
-			writeField(&b, "Input Tokens", usage.InputTokens, width)
-			writeField(&b, "Output Tokens", usage.OutputTokens, width)
-			writeField(&b, "Cost USD", usage.CostUSD, width)
-		}
-		writeField(&b, "Trajectory", record.Result.TrajectoryPath, width)
-		if record.RunErr != nil {
-			writeField(&b, "Error", record.RunErr.Error(), width)
-		}
-		if conclusion := taskConclusion(record); conclusion != "" {
-			writeSection(&b, "Submission")
-			writeField(&b, "Text", conclusion, width)
-		}
-		if record.Result.Diff != "" {
-			writeField(&b, "Diff", summarizeDiff(record.Result.Diff), width)
-		}
+	writeSection(&b, "Evidence")
+	diff := "not available"
+	if snapshot.FinalReview.ChangedFiles > 0 || record.Result.Diff != "" {
+		diff = summarizeDiff(record.Result.Diff)
 	}
+	writeField(&b, "Diff", diff, width)
+	writeField(&b, "Validation", validationSummary(snapshot), width)
+	trace := "not available"
+	if snapshot.FinalReview.Trajectory != "" {
+		trace = "available via /trace"
+	}
+	writeField(&b, "Trace", trace, width)
 
-	writeSection(&b, "Events")
-	writeField(&b, "Count", len(record.Events), width)
-	if len(record.Events) > 0 {
-		writeField(&b, "Last", summarizeEvent(record.Events[len(record.Events)-1]), width)
+	writeSection(&b, "Need attention")
+	if errText := strings.TrimSpace(lastErrorText(record)); errText != "" {
+		b.WriteString(wrapText(errText, width))
+		b.WriteByte('\n')
+	} else {
+		b.WriteString("none\n")
 	}
 	return b.String()
 }
@@ -2235,34 +2227,59 @@ func stepDetailWidth(step StepCard, width int) string {
 	return b.String()
 }
 
+func stepsViewWidth(snapshot RunSnapshot, width int) string {
+	var b strings.Builder
+	b.WriteString("Steps\n")
+	if len(snapshot.Steps) == 0 {
+		b.WriteString("\nNo steps recorded.\n")
+		return b.String()
+	}
+	for _, step := range snapshot.Steps {
+		writeField(&b, fmt.Sprintf("#%d", step.Index), stepLine(step), width)
+	}
+	return b.String()
+}
+
 func finalReviewWidth(snapshot RunSnapshot, width int) string {
 	var b strings.Builder
-	b.WriteString("Final Review\n")
+	b.WriteString("Review\n")
+	writeField(&b, "Status", snapshot.FinalReview.Status, width)
 	writeField(&b, "Goal", snapshot.Task.Text, width)
 	writeField(&b, "Repository", snapshot.Task.Repo, width)
-	writeField(&b, "Status", snapshot.FinalReview.Status, width)
-	writeField(&b, "Steps", snapshot.FinalReview.Steps, width)
-	writeField(&b, "Changed Files", snapshot.FinalReview.ChangedFiles, width)
-	writeField(&b, "Validation", fmt.Sprintf("%d/%d passed", snapshot.FinalReview.TestsPassed, snapshot.FinalReview.TestsRun), width)
-	writeField(&b, "Trajectory", snapshot.FinalReview.Trajectory, width)
 	if snapshot.FinalReview.Submission != "" {
-		writeSection(&b, "Submission")
+		writeSection(&b, "Outcome")
 		b.WriteString(wrapText(snapshot.FinalReview.Submission, width))
 		b.WriteByte('\n')
 	}
+	writeSection(&b, "Evidence")
+	diff := "not available"
+	if snapshot.FinalReview.ChangedFiles > 0 {
+		diff = fmt.Sprintf("%d files changed", snapshot.FinalReview.ChangedFiles)
+	}
+	writeField(&b, "Diff", diff, width)
+	writeField(&b, "Validation", validationSummary(snapshot), width)
+	trace := "not available"
+	if snapshot.FinalReview.Trajectory != "" {
+		trace = "available via /trace"
+	}
+	writeField(&b, "Trace", trace, width)
+	writeSection(&b, "Need attention")
+	attention := "none"
 	for _, artifact := range snapshot.Artifacts {
 		if artifact.Kind != "error" || strings.TrimSpace(artifact.Body) == "" {
 			continue
 		}
-		writeSection(&b, "Error")
-		b.WriteString(wrapText(artifact.Body, width))
-		b.WriteByte('\n')
+		attention = artifact.Body
 		break
 	}
+	b.WriteString(wrapText(attention, width))
+	b.WriteByte('\n')
 	writeSection(&b, "Actions")
 	for _, action := range []string{
 		"d inspect diff",
-		":trace inspect trajectory path",
+		":tests inspect validation",
+		"s inspect steps",
+		":trace inspect trace",
 		"i new task",
 		"q quit",
 	} {
@@ -2271,6 +2288,16 @@ func finalReviewWidth(snapshot RunSnapshot, width int) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+func validationSummary(snapshot RunSnapshot) string {
+	if snapshot.FinalReview.TestsRun == 0 {
+		return "not recorded"
+	}
+	if snapshot.FinalReview.TestsPassed == snapshot.FinalReview.TestsRun {
+		return fmt.Sprintf("passed (%d/%d)", snapshot.FinalReview.TestsPassed, snapshot.FinalReview.TestsRun)
+	}
+	return fmt.Sprintf("failed (%d/%d passed)", snapshot.FinalReview.TestsPassed, snapshot.FinalReview.TestsRun)
 }
 
 func validationViewWidth(snapshot RunSnapshot, width int) string {
@@ -2749,7 +2776,8 @@ var (
 	keyHelp           = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
 	keyDiff           = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
 	keyTests          = key.NewBinding(key.WithKeys(":tests"), key.WithHelp(":tests", "validation"))
-	keyTimeline       = key.NewBinding(key.WithKeys("t", ":timeline"), key.WithHelp("t", "steps"))
+	keySteps          = key.NewBinding(key.WithKeys("s", ":steps"), key.WithHelp("s", "steps"))
+	keyTimeline       = key.NewBinding(key.WithKeys("t", ":overview"), key.WithHelp("t", "overview"))
 	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
 	keyTrace          = key.NewBinding(key.WithKeys(":trace"), key.WithHelp(":trace", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))

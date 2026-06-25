@@ -60,11 +60,13 @@ func BuildRunSnapshot(record taskRecord, trajectoryPath string) RunSnapshot {
 			pendingWhy = stripFencedBlocks(strings.TrimSpace(fmt.Sprint(event.Data["content"])))
 			pendingWhyEvent = i
 		case "tool_call":
+			tool := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+			command := commandFromArgs(event.Data["args"])
 			step := StepCard{
 				Index:    len(snapshot.Steps) + 1,
-				Phase:    phaseForTool(event.Data["tool"]),
-				Tool:     strings.TrimSpace(fmt.Sprint(event.Data["tool"])),
-				Command:  commandFromArgs(event.Data["args"]),
+				Phase:    phaseForStep(tool, command),
+				Tool:     tool,
+				Command:  command,
 				Outcome:  "running",
 				Started:  event.Time,
 				Why:      pendingWhy,
@@ -81,10 +83,11 @@ func BuildRunSnapshot(record taskRecord, trajectoryPath string) RunSnapshot {
 			stepIndex := findOpenStep(snapshot.Steps, fmt.Sprint(event.Data["tool"]))
 			if stepIndex < 0 {
 				stepIndex = len(snapshot.Steps)
+				tool := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
 				snapshot.Steps = append(snapshot.Steps, StepCard{
 					Index:    len(snapshot.Steps) + 1,
-					Phase:    phaseForTool(event.Data["tool"]),
-					Tool:     strings.TrimSpace(fmt.Sprint(event.Data["tool"])),
+					Phase:    phaseForStep(tool, ""),
+					Tool:     tool,
 					Outcome:  "ok",
 					EventIDs: []int{},
 				})
@@ -168,6 +171,60 @@ func phaseForTool(tool any) string {
 	default:
 		return "tool"
 	}
+}
+
+func phaseForStep(tool string, command string) string {
+	tool = strings.TrimSpace(tool)
+	command = strings.TrimSpace(command)
+	if tool == "run_tests" || looksLikeValidation(command) {
+		return "validate"
+	}
+	if tool == "shell" && looksLikeEdit(command) {
+		return "edit"
+	}
+	return phaseForTool(tool)
+}
+
+func looksLikeValidation(command string) bool {
+	command = strings.ToLower(strings.TrimSpace(command))
+	if command == "" {
+		return false
+	}
+	patterns := []string{
+		"go test",
+		"npm test",
+		"pnpm test",
+		"yarn test",
+		"pytest",
+		"cargo test",
+		"mvn test",
+		"gradle test",
+		"make test",
+		"go vet",
+		"golangci-lint",
+		"ruff",
+		"eslint",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(command, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeEdit(command string) bool {
+	command = strings.ToLower(strings.TrimSpace(command))
+	if command == "" {
+		return false
+	}
+	patterns := []string{"apply_patch", "sed -i", "perl -pi", "go fmt", "gofmt", "npm run format"}
+	for _, pattern := range patterns {
+		if strings.Contains(command, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func commandFromArgs(args any) string {
