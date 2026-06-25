@@ -1518,14 +1518,31 @@ func (m *model) inspectorWidth() int {
 }
 
 func (m *model) bodyHeight() int {
-	reserved := 5
+	if m.width <= 0 || m.height <= 0 {
+		return 1
+	}
+	reserved := lipgloss.Height(m.headerView()) + lipgloss.Height(m.footerView())
 	if m.approval != nil {
 		reserved += lipgloss.Height(m.approvalView(max(1, m.width-2)))
 	}
-	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
-		reserved += 3
+	if m.composerVisible() {
+		reserved += lipgloss.Height(m.inputView())
 	}
-	return max(1, m.height-reserved)
+	_, panelFrameH := panelStyle.GetFrameSize()
+	return max(1, m.height-reserved-panelFrameH)
+}
+
+func (m *model) composerVisible() bool {
+	if m.mode == modeHelp || m.mode == modeQuitConfirm {
+		return false
+	}
+	if m.approval != nil {
+		return false
+	}
+	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
+		return true
+	}
+	return m.loop
 }
 
 func (m *model) sidebarWidth() int {
@@ -1642,7 +1659,7 @@ func (m *model) View() string {
 	if m.approval != nil {
 		parts = append(parts, m.approvalView(m.width-2))
 	}
-	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
+	if m.composerVisible() {
 		parts = append(parts, m.inputView())
 	}
 	parts = append(parts, m.footerView())
@@ -1847,13 +1864,22 @@ func (m *model) inputView() string {
 		prompt = "Search"
 	case modeTask:
 		prompt = "Task"
+	default:
+		if m.running {
+			prompt = "Queue"
+		}
 	}
+	label := inputLabelStyle.Render(" " + prompt + " ")
+	frameW, _ := inputBoxStyle.GetFrameSize()
+	boxWidth := max(1, m.width-frameW)
+	inputWidth := max(8, boxWidth-lipgloss.Width(label)-3)
+	m.command.Width = inputWidth
 	line := lipgloss.JoinHorizontal(lipgloss.Top,
-		inputLabelStyle.Render(" "+prompt+" "),
+		label,
 		" ",
 		m.command.View(),
 	)
-	return inputBoxStyle.Width(m.width - 2).Render(line)
+	return inputBoxStyle.Width(boxWidth).Render(line)
 }
 
 func (m *model) sidebarView(width, height int) string {

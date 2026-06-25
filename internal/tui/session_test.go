@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	agentpkg "github.com/local/swe-agent/internal/agent"
 	"github.com/local/swe-agent/internal/core"
 	mockmodel "github.com/local/swe-agent/internal/model"
@@ -419,6 +420,34 @@ func TestWideRunBodyShowsTimelineAndInspector(t *testing.T) {
 
 	if !strings.Contains(body, "Timeline") || !strings.Contains(body, "Inspector") || !strings.Contains(body, "[Plan]") {
 		t.Fatalf("expected wide cockpit body to include timeline and inspector, got:\n%s", body)
+	}
+}
+
+func TestComposerStaysVisibleWithinTerminalHeight(t *testing.T) {
+	for _, tc := range []struct {
+		width  int
+		height int
+		mode   uiMode
+	}{
+		{80, 10, modeTask},
+		{80, 12, modeNormal},
+		{120, 10, modeTask},
+		{120, 12, modeNormal},
+	} {
+		model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+		model.width = tc.width
+		model.height = tc.height
+		model.mode = tc.mode
+		model.running = tc.mode == modeNormal
+		model.resize()
+
+		view := model.View()
+		if got := lipgloss.Height(view); got > tc.height {
+			t.Fatalf("view height=%d exceeds terminal height=%d for width=%d mode=%v\n%s", got, tc.height, tc.width, tc.mode, view)
+		}
+		if !strings.Contains(view, "Task") && !strings.Contains(view, "Queue") && !strings.Contains(view, "Message") {
+			t.Fatalf("composer not visible for width=%d height=%d mode=%v\n%s", tc.width, tc.height, tc.mode, view)
+		}
 	}
 }
 
