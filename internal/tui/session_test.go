@@ -318,6 +318,34 @@ func TestSlashHistoryShowsTaskHistoryAndTaskDetail(t *testing.T) {
 	}
 }
 
+func TestSlashHelpShowsTutorialOverlay(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 100
+	model.height = 32
+	model.mode = modeTask
+	model.resize()
+
+	model.executeSlashCommand("/help")
+
+	if model.mode != modeHelp {
+		t.Fatalf("expected help mode, got %v", model.mode)
+	}
+	view := model.View()
+	if got := lipgloss.Height(view); got > model.height {
+		t.Fatalf("help overlay height=%d exceeds terminal height=%d\n%s", got, model.height, view)
+	}
+	for _, want := range []string{"swe-agent", "Help", "Close: esc/q/?", "Composer", "Slash commands", "/history"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expected help overlay to contain %q, got:\n%s", want, view)
+		}
+	}
+
+	model.handleHelpKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if model.mode != modeTask {
+		t.Fatalf("expected help close to restore task mode, got %v", model.mode)
+	}
+}
+
 func TestHistoryEnterSwitchesSelectedTaskWorkbench(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	model.detail.Width = 80

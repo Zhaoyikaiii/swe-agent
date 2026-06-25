@@ -1650,9 +1650,12 @@ func (m *model) View() string {
 		return "starting..."
 	}
 	if m.mode == modeHelp {
-		return m.helpView()
+		return m.helpOverlayView()
 	}
+	return m.appView()
+}
 
+func (m *model) appView() string {
 	header := m.headerView()
 	body := m.bodyView()
 	parts := []string{header, body}
@@ -1983,15 +1986,84 @@ func (m *model) footerView() string {
 	return footerStyle.Width(m.width).Render(fillLine(left, shortcuts+" ", m.width))
 }
 
-func (m *model) helpView() string {
-	header := headerStyle.Width(m.width).Render(" swe-agent help ")
-	contentHeight := max(1, m.height-2)
-	content := panelStyle.
-		Width(m.width - 2).
-		Height(contentHeight).
-		Render(m.help.FullHelpView(m.fullHelp()))
-	footer := footerStyle.Width(m.width).Render("q/esc/? close help")
-	return lipgloss.JoinVertical(lipgloss.Left, header, content, footer)
+func (m *model) helpOverlayView() string {
+	previousMode := m.beforeHelp
+	if previousMode == modeHelp {
+		previousMode = modeNormal
+	}
+	currentMode := m.mode
+	m.mode = previousMode
+	base := m.appView()
+	m.mode = currentMode
+	return overlayRows(base, m.helpDialog(), m.width, m.height)
+}
+
+func (m *model) helpDialog() string {
+	dialogWidth := max(1, min(88, m.width-4))
+	dialogHeight := max(1, min(22, m.height-2))
+	if dialogWidth < min(32, m.width) {
+		dialogWidth = min(32, m.width)
+	}
+	if dialogHeight < min(8, m.height) {
+		dialogHeight = min(8, m.height)
+	}
+	frameW, frameH := helpDialogStyle.GetFrameSize()
+	innerWidth := max(20, dialogWidth-frameW)
+	innerHeight := max(1, dialogHeight-frameH)
+	m.help.Width = innerWidth
+	content := fitHeight(m.helpContent(innerWidth), innerHeight)
+	return helpDialogStyle.
+		Width(innerWidth).
+		Height(innerHeight).
+		Render(content)
+}
+
+func (m *model) helpContent(width int) string {
+	sections := []string{
+		"Help",
+		"Close: esc/q/?",
+		"",
+		wrapText("The bottom composer is the stable place for tasks and slash commands. During a run it stays visible as Queue while the timeline and inspector update above it.", width),
+		"",
+		"Composer",
+		wrapText("  i starts task input. Enter submits. Slash commands work from the composer, for example /history or /diff.", width),
+		"",
+		"Slash commands",
+		wrapText("  /help opens this guide. /history shows prior runs. /clear resets the visible session. /diff, /tests, /steps, /trace, and /open-trace switch inspector views. /quit exits or cancels.", width),
+		"",
+		"Navigation",
+		m.help.FullHelpView(m.fullHelp()),
+		"",
+		"Close",
+		"  esc, q, or ? closes help and returns to the current TUI.",
+	}
+	return strings.Join(sections, "\n")
+}
+
+func overlayRows(base, popup string, width, height int) string {
+	if width <= 0 || height <= 0 {
+		return popup
+	}
+	lines := strings.Split(strings.TrimRight(base, "\n"), "\n")
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	popupLines := strings.Split(strings.TrimRight(popup, "\n"), "\n")
+	if len(popupLines) > height {
+		popupLines = popupLines[:height]
+	}
+	startY := max(0, (height-len(popupLines))/2)
+	for i, line := range popupLines {
+		row := startY + i
+		if row >= len(lines) {
+			break
+		}
+		lines[row] = lipgloss.PlaceHorizontal(width, lipgloss.Center, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *model) shortHelp() []key.Binding {
@@ -1999,7 +2071,7 @@ func (m *model) shortHelp() []key.Binding {
 	case modeApproval:
 		return []key.Binding{keyAllow, keyDeny, keyRemember, keyHelp}
 	case modeTask:
-		return []key.Binding{keyEnter, keySlashHistory, keySlashClear, keyEsc}
+		return []key.Binding{keyEnter, keySlashHelp, keySlashHistory, keySlashClear, keyEsc}
 	case modeCommand, modeSearch:
 		return []key.Binding{keyEnter, keyEsc}
 	default:
@@ -2013,7 +2085,7 @@ func (m *model) fullHelp() [][]key.Binding {
 		{keyScrollHalf, keyScrollPage, keyTab, keyOpen},
 		{keySearch, keyNext, keyPrev, keyCommand, keyHelp},
 		{keyDiff, keyTests, keySteps, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
-		{keyTaskInput, keySlashHistory, keySlashClear, keySlashQuit},
+		{keyTaskInput, keySlashHelp, keySlashHistory, keySlashClear, keySlashQuit},
 		{keyAllow, keyDeny, keyRemember, keyExpandApproval},
 		{keyQuit, keyCancel},
 	}
@@ -3070,6 +3142,10 @@ var (
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("214")).
 			Padding(0, 1)
+	helpDialogStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(colorAccent).
+			Padding(0, 2)
 	inputBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(colorAccent).
@@ -3105,6 +3181,7 @@ var (
 	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
 	keyTrace          = key.NewBinding(key.WithKeys("x", ":trace"), key.WithHelp("x", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
+	keySlashHelp      = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
 	keySlashHistory   = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
 	keySlashClear     = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
 	keySlashQuit      = key.NewBinding(key.WithKeys("/quit"), key.WithHelp("/quit", "quit"))
