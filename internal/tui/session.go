@@ -162,7 +162,11 @@ const (
 )
 
 type traceWorkspaceState struct {
-	Tab traceTab
+	Tab        traceTab
+	Cursor     int
+	SelectedID string
+	Expanded   map[string]bool
+	FollowLive bool
 }
 
 type sidebarMode int
@@ -324,6 +328,12 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, parent conte
 		phase:        phaseStarting,
 		phaseHint:    "starting agent",
 		startedAt:    time.Now(),
+		traceView: traceWorkspaceState{
+			Tab: traceTabTrace,
+			Expanded: map[string]bool{
+				"node-root": true,
+			},
+		},
 	}
 }
 
@@ -477,6 +487,18 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		case "1", "2", "3", "4", "5", "6":
 			m.setTraceTab(keyString)
+			return nil
+		case "j", "down":
+			m.moveTraceCursor(1)
+			return nil
+		case "k", "up":
+			m.moveTraceCursor(-1)
+			return nil
+		case "enter":
+			m.toggleTraceNode()
+			return nil
+		case "o":
+			m.openTraceNode()
 			return nil
 		}
 	}
@@ -1419,6 +1441,73 @@ func (m *model) cycleTraceTab(delta int) {
 	next := (int(m.traceView.Tab) + delta + total) % total
 	m.traceView.Tab = traceTab(next)
 	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
+	m.updateDetail()
+}
+
+func (m *model) moveTraceCursor(delta int) {
+	if m.traceView.Tab != traceTabTrace {
+		return
+	}
+	m.traceView.ensureDefaults()
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	if len(vm.Rows) == 0 {
+		m.traceView.Cursor = 0
+		m.traceView.SelectedID = ""
+		m.updateDetail()
+		return
+	}
+	normalizeTraceCursor(&m.traceView, vm.Rows)
+	m.traceView.Cursor = clamp(m.traceView.Cursor+delta, 0, len(vm.Rows)-1)
+	m.traceView.SelectedID = vm.Rows[m.traceView.Cursor].NodeID
+	m.updateDetail()
+}
+
+func (m *model) toggleTraceNode() {
+	if m.traceView.Tab != traceTabTrace {
+		return
+	}
+	m.traceView.ensureDefaults()
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	if len(vm.Rows) == 0 {
+		return
+	}
+	normalizeTraceCursor(&m.traceView, vm.Rows)
+	row := vm.Rows[m.traceView.Cursor]
+	if !row.HasKids {
+		return
+	}
+	m.traceView.Expanded[row.NodeID] = !m.traceView.Expanded[row.NodeID]
+	m.traceView.SelectedID = row.NodeID
+	vm = buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	normalizeTraceCursor(&m.traceView, vm.Rows)
+	m.updateDetail()
+}
+
+func (m *model) openTraceNode() {
+	if m.traceView.Tab != traceTabTrace {
+		return
+	}
+	m.traceView.ensureDefaults()
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	if len(vm.Rows) == 0 {
+		return
+	}
+	normalizeTraceCursor(&m.traceView, vm.Rows)
+	row := vm.Rows[m.traceView.Cursor]
+	m.traceView.SelectedID = row.NodeID
+	m.status = "trace node: " + row.NodeID
 	m.updateDetail()
 }
 

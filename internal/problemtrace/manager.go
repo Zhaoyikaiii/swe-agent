@@ -32,6 +32,7 @@ type Manager struct {
 	lastModelSpanID string
 	patchApplied    bool
 	verificationOK  bool
+	historyNodes    []TraceNode
 }
 
 type PromptInput struct {
@@ -97,7 +98,7 @@ func (m *Manager) StartRun(ctx context.Context, task core.Task, resource TraceRe
 		},
 	}
 	m.trace.Spans = append(m.trace.Spans, runSpan)
-	m.trace.History = append(m.trace.History, TraceNode{
+	rootNodeEvent := m.addHistoryNodeLocked(TraceNode{
 		ID:      "node-root",
 		Kind:    "problem",
 		Title:   "Problem",
@@ -117,6 +118,7 @@ func (m *Manager) StartRun(ctx context.Context, task core.Task, resource TraceRe
 			"trace_context": m.contextLocked(m.runSpanID),
 			"span":          runSpan,
 		}),
+		rootNodeEvent,
 		m.eventLocked("frontier_updated", map[string]any{
 			"trace_context": m.contextLocked(m.runSpanID),
 			"frontier":      m.trace.Frontier,
@@ -136,6 +138,7 @@ func (m *Manager) resetRunLocked() {
 	m.lastModelSpanID = ""
 	m.patchApplied = false
 	m.verificationOK = false
+	m.historyNodes = nil
 }
 
 func (m *Manager) BuildPrompt(ctx context.Context, input PromptInput) PromptResult {
@@ -175,7 +178,7 @@ func (m *Manager) BuildPrompt(ctx context.Context, input PromptInput) PromptResu
 		CreatedAt:     time.Now(),
 	}
 	m.trace.Prompts = append(m.trace.Prompts, snapshot)
-	m.trace.History = append(m.trace.History, TraceNode{
+	promptNodeEvent := m.addHistoryNodeLocked(TraceNode{
 		ID:       "node-" + promptID,
 		ParentID: "node-root",
 		Kind:     "prompt",
@@ -209,6 +212,7 @@ func (m *Manager) BuildPrompt(ctx context.Context, input PromptInput) PromptResu
 				"trace_context": traceContext,
 				"snapshot":      snapshot,
 			}),
+			promptNodeEvent,
 			m.eventLocked("trace_span_ended", map[string]any{
 				"trace_context": m.contextLocked(span.SpanID),
 				"span":          span,
@@ -379,6 +383,9 @@ func (m *Manager) ObserveToolResult(ctx context.Context, tc TraceContext, call c
 			"evidence":      item.Evidence,
 		}))
 	}
+	for _, node := range changes.HistoryNodes {
+		events = append(events, m.traceNodeAddedEventLocked(node))
+	}
 	if changes.FrontierUpdated {
 		events = append(events, m.eventLocked("frontier_updated", map[string]any{
 			"trace_context": tc,
@@ -523,6 +530,7 @@ func (m *Manager) applyToolObservationLocked(tc TraceContext, call core.ToolCall
 	before := hashAny(m.trace.Frontier)
 	m.updateFrontierLocked()
 	changes.FrontierUpdated = before != hashAny(m.trace.Frontier)
+	changes.HistoryNodes = append(changes.HistoryNodes, m.drainHistoryNodesLocked()...)
 	m.trace.UpdatedAt = time.Now()
 	return changes
 }
@@ -587,7 +595,7 @@ func (m *Manager) ensureDirectionLocked(id, hypothesis, rationale string, priori
 	}
 	m.trace.Directions = append(m.trace.Directions, direction)
 	m.trace.Frontier.ActiveDirectionID = id
-	m.trace.History = append(m.trace.History, TraceNode{
+	m.queueHistoryNodeLocked(TraceNode{
 		ID:          "node-" + id,
 		ParentID:    "node-root",
 		Kind:        "direction",
@@ -648,7 +656,7 @@ func (m *Manager) addEvidenceLocked(directionID, summary, detail string, relatio
 			}
 		}
 	}
-	m.trace.History = append(m.trace.History, TraceNode{
+	m.queueHistoryNodeLocked(TraceNode{
 		ID:          "node-" + ev.ID,
 		ParentID:    "node-" + directionID,
 		Kind:        "evidence",
@@ -885,6 +893,37 @@ func (m *Manager) contextLocked(spanID string) TraceContext {
 		}
 	}
 	return tc
+}
+
+func (m *Manager) addHistoryNodeLocked(node TraceNode) core.Event {
+	node = cloneTraceNode(node)
+	m.trace.History = append(m.trace.History, node)
+	return m.traceNodeAddedEventLocked(node)
+}
+
+func (m *Manager) queueHistoryNodeLocked(node TraceNode) {
+	node = cloneTraceNode(node)
+	m.trace.History = append(m.trace.History, node)
+	m.historyNodes = append(m.historyNodes, node)
+}
+
+func (m *Manager) drainHistoryNodesLocked() []TraceNode {
+	nodes := append([]TraceNode(nil), m.historyNodes...)
+	m.historyNodes = nil
+	return nodes
+}
+
+func (m *Manager) traceNodeAddedEventLocked(node TraceNode) core.Event {
+	node = cloneTraceNode(node)
+	return m.eventLocked("trace_node_added", map[string]any{
+		"trace_context": m.contextLocked(m.runSpanID),
+		"node":          node,
+	})
+}
+
+func cloneTraceNode(node TraceNode) TraceNode {
+	node.EventIDs = append([]int(nil), node.EventIDs...)
+	return node
 }
 
 func (m *Manager) eventLocked(eventType string, data map[string]any) core.Event {

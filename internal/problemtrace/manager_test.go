@@ -63,6 +63,56 @@ func TestManagerTurnsImportCycleIntoFrontier(t *testing.T) {
 	}
 }
 
+func TestManagerEmitsTraceNodeAddedEvents(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager()
+	events := manager.StartRun(ctx, core.Task{Text: "fix tests", Repo: "/repo"}, TraceResource{RepoPath: "/repo", ModelProvider: "mock", Model: "mock"})
+
+	prompt := manager.BuildPrompt(ctx, PromptInput{
+		Step:       1,
+		Model:      "mock",
+		Provider:   "mock",
+		WorkingDir: "/repo",
+		Messages: []core.Message{
+			{Role: core.RoleSystem, Content: "system"},
+			{Role: core.RoleUser, Content: "fix tests"},
+		},
+		Tools: []core.ToolSpec{{Name: "run_tests", Description: "run tests"}},
+	})
+	events = append(events, prompt.Events...)
+
+	call := core.ToolCall{Name: "run_tests", Args: map[string]any{"command": "go test ./..."}}
+	tc, startEvents := manager.StartToolCall(ctx, 1, call)
+	events = append(events, startEvents...)
+	events = append(events, manager.ObserveToolResult(ctx, tc, call, core.ToolResult{
+		Code:   1,
+		Output: "package example\n\timports example/internal/a\n\timports example/internal/b: import cycle not allowed\nFAIL ./...",
+	})...)
+
+	var nodeIDs []string
+	for _, event := range events {
+		if event.Type != "trace_node_added" {
+			continue
+		}
+		var node TraceNode
+		if !decodeInto(event.Data["node"], &node) {
+			t.Fatalf("invalid trace node event payload: %#v", event.Data["node"])
+		}
+		nodeIDs = append(nodeIDs, node.ID)
+	}
+
+	for _, want := range []string{"node-root", "node-prompt-1", "node-dir-go-import-cycle", "node-evidence-1"} {
+		if !contains(nodeIDs, want) {
+			t.Fatalf("expected trace_node_added for %s, got %#v", want, nodeIDs)
+		}
+	}
+
+	replayed := Replay(events)
+	if len(replayed.History) != len(nodeIDs) {
+		t.Fatalf("expected replayed history from trace_node_added events, got history=%d events=%d", len(replayed.History), len(nodeIDs))
+	}
+}
+
 func TestManagerStartRunResetsPerRunState(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager()

@@ -11,24 +11,25 @@ import (
 )
 
 func traceWorkspaceViewWidth(record taskRecord, state traceWorkspaceState, width int, trajectoryPath string) string {
-	trace := problemtrace.FromEvents(record.Events)
+	state.ensureDefaults()
+	vm := buildTraceWorkspaceVM(record, state, trajectoryPath)
 	var b strings.Builder
 	b.WriteString("Problem Trace Workspace\n")
 	b.WriteString(traceTabs(state.Tab))
 	b.WriteString("\n\n")
 	switch state.Tab {
 	case traceTabFrontier:
-		renderTraceFrontier(&b, trace, width)
+		renderTraceFrontier(&b, vm.Trace, width)
 	case traceTabMemory:
-		renderTraceMemory(&b, trace, width)
+		renderTraceMemory(&b, vm.Trace, width)
 	case traceTabEvents:
 		renderTraceEvents(&b, record.Events, width)
 	case traceTabPrompt:
-		renderTracePrompts(&b, trace, width)
+		renderTracePrompts(&b, vm.Trace, width)
 	case traceTabCards:
-		renderTraceCards(&b, trace, width)
+		renderTraceCards(&b, vm.Trace, width)
 	default:
-		renderTraceTree(&b, trace, width, trajectoryPath)
+		renderTraceTreeTab(&b, vm, state, width)
 	}
 	return b.String()
 }
@@ -63,38 +64,7 @@ func traceTabLabel(tab traceTab) string {
 	}
 }
 
-func renderTraceTree(b *strings.Builder, trace problemtrace.ProblemTrace, width int, trajectoryPath string) {
-	writeField(b, "Trace ID", trace.TraceID, width)
-	writeField(b, "Trajectory", trajectoryPath, width)
-	writeField(b, "Repository", trace.Problem.Repo, width)
-	writeField(b, "Task", trace.Problem.UserTask, width)
-	if trace.Problem.ErrorSummary != "" {
-		writeField(b, "Current Symptom", trace.Problem.ErrorSummary, width)
-	}
-
-	writeSection(b, "Trace History")
-	if len(trace.History) == 0 {
-		b.WriteString("No trace nodes yet.\n")
-	} else {
-		for _, node := range trace.History {
-			prefix := traceNodePrefix(node)
-			line := prefix + " " + node.Title
-			if node.Status != "" {
-				line += " (" + node.Status + ")"
-			}
-			b.WriteString(wrapText(line, width))
-			b.WriteByte('\n')
-			if node.Summary != "" {
-				b.WriteString(indentText(wrapText(node.Summary, remainingWidth(width, 2)), 2))
-				b.WriteByte('\n')
-			}
-			if len(node.EventIDs) > 0 {
-				b.WriteString(mutedStyle.Render(indentText("events: "+formatEventIDs(node.EventIDs), 2)))
-				b.WriteByte('\n')
-			}
-		}
-	}
-
+func renderTraceSpanGraph(b *strings.Builder, trace problemtrace.ProblemTrace, width int) {
 	writeSection(b, "Span Graph")
 	if len(trace.Spans) == 0 {
 		b.WriteString("No spans recorded yet.\n")
@@ -281,26 +251,6 @@ func renderStringList(b *strings.Builder, title string, values []string, width i
 	for _, value := range values {
 		b.WriteString(wrapText("- "+value, width))
 		b.WriteByte('\n')
-	}
-}
-
-func traceNodePrefix(node problemtrace.TraceNode) string {
-	switch node.Kind {
-	case "direction":
-		if node.Status == string(problemtrace.DirectionActive) {
-			return ">"
-		}
-		return "D"
-	case "symptom":
-		return "!"
-	case "evidence":
-		return "+"
-	case "prompt":
-		return "P"
-	case "events":
-		return "E"
-	default:
-		return "*"
 	}
 }
 

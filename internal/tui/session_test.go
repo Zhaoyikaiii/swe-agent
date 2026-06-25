@@ -306,7 +306,14 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		Result: agentpkg.Result{TrajectoryPath: "trajectories/run-import-cycle.jsonl"},
 	}
 
-	rendered := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabTrace}, 120, record.Result.TrajectoryPath)
+	state := traceWorkspaceState{
+		Tab: traceTabTrace,
+		Expanded: map[string]bool{
+			"node-root":                true,
+			"node-dir-go-import-cycle": true,
+		},
+	}
+	rendered := traceWorkspaceViewWidth(record, state, 120, record.Result.TrajectoryPath)
 	t.Logf("rendered trace tree:\n%s", rendered)
 
 	for _, want := range []string{
@@ -317,12 +324,14 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Repository: /repo",
 		"Task: fix go test import cycle",
 		"Current Symptom: Go compile failed with import cycle not allowed: go test ./...",
-		"Trace History",
-		"* Problem (Go compile failed with import cycle not allowed: go test ./...)",
-		"! Go compile failed with import cycle not allowed: go test ./... (observed)",
-		"D Resolve the Go import cycle (supported)",
-		"+ package service imports handler and handler imports service (supports)",
-		"P Prompt snapshot 1 (captured)",
+		"Trace Tree",
+		"> [-] o Problem  problem  Go compile failed with import cycle not allowed: go test ./...",
+		"+-- [ ] v Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
+		"+-- [-] v Resolve the Go import cycle  direction  supported",
+		"|   `-- [ ] v package service imports handler and handler imports service  evidence  supports",
+		"+-- [ ] v Prompt snapshot 1  prompt  captured",
+		"Selected Node",
+		"ID: node-root",
 		"Span Graph",
 		"span-1 problem.run parent=root status=ok",
 		"span-2 prompt.build parent=span-1 status=ok",

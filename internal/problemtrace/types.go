@@ -177,6 +177,7 @@ type ChangeSet struct {
 	Symptoms        []Symptom
 	Directions      []InvestigationDirection
 	Evidence        []DirectionEvidence
+	HistoryNodes    []TraceNode
 	FrontierUpdated bool
 	Prompts         []PromptSnapshot
 	Cards           []MemoryCard

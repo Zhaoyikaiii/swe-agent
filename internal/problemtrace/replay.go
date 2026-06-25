@@ -11,6 +11,7 @@ import (
 
 func FromEvents(events []core.Event) ProblemTrace {
 	trace := ProblemTrace{}
+	hasTraceNodeEvents := false
 	for i, event := range events {
 		switch event.Type {
 		case "user_task":
@@ -42,6 +43,12 @@ func FromEvents(events []core.Event) ProblemTrace {
 			var snapshot PromptSnapshot
 			if decodeInto(event.Data["snapshot"], &snapshot) && snapshot.ID != "" && !hasPrompt(trace, snapshot.ID) {
 				trace.Prompts = append(trace.Prompts, snapshot)
+			}
+		case "trace_node_added":
+			var node TraceNode
+			if decodeInto(event.Data["node"], &node) && strings.TrimSpace(node.ID) != "" && !hasTraceNode(trace, node.ID) {
+				hasTraceNodeEvents = true
+				trace.History = append(trace.History, cloneReplayTraceNode(node))
 			}
 		case "symptom_detected":
 			var symptom Symptom
@@ -82,7 +89,9 @@ func FromEvents(events []core.Event) ProblemTrace {
 		trace.TraceID = "trace-empty"
 		trace.RunID = trace.TraceID
 	}
-	buildHistory(&trace, events)
+	if !hasTraceNodeEvents {
+		buildHistory(&trace, events)
+	}
 	if len(trace.Frontier.RecommendedActions) == 0 && len(trace.Directions) == 0 {
 		trace.Frontier.RecommendedActions = []NextAction{{
 			ID:       "next-reproduce",
@@ -93,6 +102,10 @@ func FromEvents(events []core.Event) ProblemTrace {
 		trace.Frontier.OpenQuestions = []string{"What exact observation reproduces the reported problem?"}
 	}
 	return trace
+}
+
+func Replay(events []core.Event) ProblemTrace {
+	return FromEvents(events)
 }
 
 func buildHistory(trace *ProblemTrace, events []core.Event) {
@@ -308,6 +321,20 @@ func hasCard(trace ProblemTrace, id string) bool {
 		}
 	}
 	return false
+}
+
+func hasTraceNode(trace ProblemTrace, id string) bool {
+	for _, item := range trace.History {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneReplayTraceNode(node TraceNode) TraceNode {
+	node.EventIDs = append([]int(nil), node.EventIDs...)
+	return node
 }
 
 func appendIfMissing(values []int, value int) []int {
