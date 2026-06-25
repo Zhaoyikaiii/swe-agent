@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/local/swe-agent/internal/problemtrace"
 )
 
@@ -47,6 +48,19 @@ type TraceTreeRow struct {
 	HasKids   bool
 	EventIDs  []int
 }
+
+var (
+	traceDefaultStyle   = lipgloss.NewStyle()
+	traceProblemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	traceDirectionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	traceEvidenceStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	tracePromptStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("177"))
+	traceMemoryStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	traceEventStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	traceFixStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)
+	traceErrorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	traceSelectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("24")).Bold(true)
+)
 
 func (s *traceWorkspaceState) ensureDefaults() {
 	if s.Expanded == nil {
@@ -217,7 +231,8 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 		b.WriteString(renderTraceNodeInspector(vm.Rows[cursor], *vm.Selected, width))
 	}
 
-	renderTraceSpanGraph(b, trace, width)
+	// Keep the Trace tab focused on the problem tree and selected node details.
+	// Span-level data remains available to move into a dedicated tab later.
 }
 
 func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width int) string {
@@ -253,7 +268,9 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 		if row.Status != "" {
 			line += "  " + row.Status
 		}
-		b.WriteString(truncate(line, width))
+		line = truncate(line, width)
+		line = traceNodeLineStyle(row.Kind, row.Status, i == cursor).Render(line)
+		b.WriteString(line)
 		b.WriteByte('\n')
 
 		if i == cursor && strings.TrimSpace(row.Summary) != "" {
@@ -332,7 +349,7 @@ func traceStatusASCII(status string) string {
 	case "running", "active":
 		return "*"
 	case "ok", "supported", "fixed", "submitted", "captured", "supports", "observed":
-		return "v"
+		return "+"
 	case "refuted", "failed", "failure", "error", "refutes":
 		return "x"
 	case "blocked", "timeout":
@@ -340,7 +357,37 @@ func traceStatusASCII(status string) string {
 	case "open", "":
 		return "o"
 	default:
-		return "o"
+		return "."
+	}
+}
+
+func traceNodeLineStyle(kind string, status string, selected bool) lipgloss.Style {
+	if selected {
+		return traceSelectedStyle
+	}
+
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "error", "failed", "failure", "refuted", "timeout", "blocked":
+		return traceErrorStyle
+	}
+
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "problem":
+		return traceProblemStyle
+	case "direction":
+		return traceDirectionStyle
+	case "evidence", "symptom":
+		return traceEvidenceStyle
+	case "prompt":
+		return tracePromptStyle
+	case "memory", "card":
+		return traceMemoryStyle
+	case "events", "event":
+		return traceEventStyle
+	case "fix", "verification":
+		return traceFixStyle
+	default:
+		return traceDefaultStyle
 	}
 }
 

@@ -325,24 +325,20 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Task: fix go test import cycle",
 		"Current Symptom: Go compile failed with import cycle not allowed: go test ./...",
 		"Trace Tree",
-		"> [-] o Problem  problem  Go compile failed with import cycle not allowed: go test ./...",
-		"+-- [ ] v Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
-		"+-- [-] v Resolve the Go import cycle  direction  supported",
-		"|   `-- [ ] v package service imports handler and handler imports service  evidence  supports",
-		"+-- [ ] v Prompt snapshot 1  prompt  captured",
+		"> [-] . Problem  problem  Go compile failed with import cycle not allowed: go test ./...",
+		"+-- [ ] + Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
+		"+-- [-] + Resolve the Go import cycle  direction  supported",
+		"|   `-- [ ] + package service imports handler and handler imports service  evidence  supports",
+		"+-- [ ] + Prompt snapshot 1  prompt  captured",
 		"Selected Node",
 		"ID: node-root",
-		"Span Graph",
-		"span-1 problem.run parent=root status=ok",
-		"span-2 prompt.build parent=span-1 status=ok",
-		"span-3 model.call parent=span-1 status=ok",
-		"span-4 test.run parent=span-3 status=error",
-		"Links",
-		"span-4 --supports--> dir-go-import-cycle",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected rendered trace tree to contain %q, got:\n%s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "Span Graph") {
+		t.Fatalf("expected trace tab to omit span graph, got:\n%s", rendered)
 	}
 }
 
@@ -713,6 +709,35 @@ func TestWideRunBodyShowsTimelineAndInspector(t *testing.T) {
 
 	if !strings.Contains(body, "Timeline") || !strings.Contains(body, "Inspector") || !strings.Contains(body, "[Plan]") {
 		t.Fatalf("expected wide cockpit body to include timeline and inspector, got:\n%s", body)
+	}
+}
+
+func TestWideTraceUsesFullWidthWorkspace(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 30
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix go test import cycle", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+
+	model.openTraceWorkspace()
+	model.resize()
+	body := model.bodyView()
+
+	if strings.Contains(body, "Inspector") || strings.Contains(body, "Timeline") {
+		t.Fatalf("expected trace focus body to omit cockpit panes, got:\n%s", body)
+	}
+	if !strings.Contains(body, "Problem Trace Workspace") || !strings.Contains(body, "Trace Tree") {
+		t.Fatalf("expected trace workspace body, got:\n%s", body)
+	}
+	if model.detail.Width != 116 {
+		t.Fatalf("expected full-width trace detail viewport, got %d", model.detail.Width)
+	}
+	if model.focus != "detail" || model.sidebar != sidebarRun || model.mode != modeNormal {
+		t.Fatalf("expected trace focus state, got focus=%q sidebar=%v mode=%v", model.focus, model.sidebar, model.mode)
+	}
+	if footer := model.footerView(); !strings.Contains(footer, "trace tabs") {
+		t.Fatalf("expected trace-specific footer help, got:\n%s", footer)
 	}
 }
 

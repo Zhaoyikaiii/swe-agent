@@ -567,10 +567,7 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		m.focus = "detail"
 		m.updateDetail()
 	case "x":
-		m.view = viewTrace
-		m.focus = "detail"
-		m.status = "trace workspace"
-		m.updateDetail()
+		m.openTraceWorkspace()
 	case "t":
 		m.showRun()
 	case "o":
@@ -789,10 +786,7 @@ func (m *model) executeCommand(command string) tea.Cmd {
 	case "history", "tasks":
 		m.showHistory()
 	case "trace":
-		m.view = viewTrace
-		m.focus = "detail"
-		m.status = "trace workspace"
-		m.updateDetail()
+		m.openTraceWorkspace()
 	case "open-trace":
 		return m.openTrace()
 	default:
@@ -829,10 +823,7 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 	case "history", "tasks":
 		m.showHistory()
 	case "trace":
-		m.view = viewTrace
-		m.focus = "detail"
-		m.status = "trace workspace"
-		m.updateDetail()
+		m.openTraceWorkspace()
 	case "open-trace":
 		return m.openTrace()
 	default:
@@ -1536,6 +1527,17 @@ func (m *model) setTraceTab(key string) {
 	m.updateDetail()
 }
 
+func (m *model) openTraceWorkspace() {
+	m.view = viewTrace
+	m.sidebar = sidebarRun
+	m.focus = "detail"
+	m.mode = modeNormal
+	m.command.Blur()
+	m.traceView.ensureDefaults()
+	m.status = "trace workspace"
+	m.updateDetail()
+}
+
 func (m *model) showHistory() {
 	m.sidebar = sidebarHistory
 	m.view = viewOverview
@@ -1658,6 +1660,9 @@ func (m *model) syncDetailSize() {
 }
 
 func (m *model) contentWidth() int {
+	if m.traceFocusLayout() {
+		return max(20, m.width-2) - 2
+	}
 	if m.sidebar == sidebarHistory {
 		return max(20, m.width-m.sidebarWidth()-1) - 2
 	}
@@ -1665,6 +1670,10 @@ func (m *model) contentWidth() int {
 		return max(20, m.inspectorWidth()-2)
 	}
 	return max(20, m.width-2) - 2
+}
+
+func (m *model) traceFocusLayout() bool {
+	return m.sidebar != sidebarHistory && m.view == viewTrace
 }
 
 func (m *model) cockpitLayout() bool {
@@ -1919,6 +1928,13 @@ func (m *model) bodyView() string {
 	m.syncDetailSize()
 	bodyHeight := m.bodyHeight()
 	if m.sidebar != sidebarHistory {
+		if m.view == viewTrace {
+			return panelStyle.
+				Width(max(20, m.width-2)).
+				Height(bodyHeight).
+				BorderForeground(focusColor(true)).
+				Render(m.detail.View())
+		}
 		if m.cockpitLayout() {
 			inspectorWidth := m.inspectorWidth()
 			timelineWidth := max(40, m.width-inspectorWidth-1)
@@ -2246,6 +2262,10 @@ func overlayRows(base, popup string, width, height int) string {
 }
 
 func (m *model) shortHelp() []key.Binding {
+	if m.view == viewTrace && m.mode == modeNormal {
+		return []key.Binding{keyTraceMove, keyTraceFold, keyTraceTabs, keyEsc}
+	}
+
 	switch m.mode {
 	case modeApproval:
 		return []key.Binding{keyAllow, keyDeny, keyRemember, keyHelp}
@@ -3382,6 +3402,9 @@ var (
 	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
 	keyTrace          = key.NewBinding(key.WithKeys("x", ":trace"), key.WithHelp("x", "trace path"))
 	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
+	keyTraceMove      = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "node"))
+	keyTraceFold      = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "fold"))
+	keyTraceTabs      = key.NewBinding(key.WithKeys("tab", "1-6"), key.WithHelp("tab/1-6", "trace tabs"))
 	keySlashHelp      = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
 	keySlashHistory   = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
 	keySlashClear     = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
