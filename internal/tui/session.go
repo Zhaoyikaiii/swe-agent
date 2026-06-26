@@ -589,16 +589,32 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 				m.cycleTraceEventTab(1)
 				return nil
 			case "j", "down":
-				m.moveTraceEventCursor(1)
+				if m.traceView.EventPane == tracePaneDetail {
+					m.moveTraceEventDetail(1)
+				} else {
+					m.moveTraceEventCursor(1)
+				}
 				return nil
 			case "k", "up":
-				m.moveTraceEventCursor(-1)
+				if m.traceView.EventPane == tracePaneDetail {
+					m.moveTraceEventDetail(-1)
+				} else {
+					m.moveTraceEventCursor(-1)
+				}
 				return nil
-			case "pgdown":
-				m.moveTraceEventDetail(1)
+			case "pgdown", "pagedown", "ctrl+f":
+				if m.traceView.EventPane == tracePaneDetail {
+					m.moveTraceEventDetail(m.traceScrollPageStep())
+				} else {
+					m.moveTraceEventCursor(m.traceScrollPageStep())
+				}
 				return nil
-			case "pgup":
-				m.moveTraceEventDetail(-1)
+			case "pgup", "pageup", "ctrl+b":
+				if m.traceView.EventPane == tracePaneDetail {
+					m.moveTraceEventDetail(-m.traceScrollPageStep())
+				} else {
+					m.moveTraceEventCursor(-m.traceScrollPageStep())
+				}
 				return nil
 			case "enter", "o":
 				m.openTraceEvent()
@@ -620,16 +636,32 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 				m.cycleTraceCollectionTab(1)
 				return nil
 			case "j", "down":
-				m.moveTraceCollectionCursor(1)
+				if m.traceView.CollectionPane == tracePaneDetail {
+					m.moveTraceCollectionDetail(1)
+				} else {
+					m.moveTraceCollectionCursor(1)
+				}
 				return nil
 			case "k", "up":
-				m.moveTraceCollectionCursor(-1)
+				if m.traceView.CollectionPane == tracePaneDetail {
+					m.moveTraceCollectionDetail(-1)
+				} else {
+					m.moveTraceCollectionCursor(-1)
+				}
 				return nil
-			case "pgdown":
-				m.moveTraceCollectionDetail(1)
+			case "pgdown", "pagedown", "ctrl+f":
+				if m.traceView.CollectionPane == tracePaneDetail {
+					m.moveTraceCollectionDetail(m.traceScrollPageStep())
+				} else {
+					m.moveTraceCollectionCursor(m.traceScrollPageStep())
+				}
 				return nil
-			case "pgup":
-				m.moveTraceCollectionDetail(-1)
+			case "pgup", "pageup", "ctrl+b":
+				if m.traceView.CollectionPane == tracePaneDetail {
+					m.moveTraceCollectionDetail(-m.traceScrollPageStep())
+				} else {
+					m.moveTraceCollectionCursor(-m.traceScrollPageStep())
+				}
 				return nil
 			case "enter", "o":
 				m.openTraceCollectionItem()
@@ -662,6 +694,20 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 					m.moveTraceDetail(-1)
 				} else {
 					m.moveTraceCursor(-1)
+				}
+				return nil
+			case "pgdown", "pagedown", "ctrl+f":
+				if m.traceView.Pane == tracePaneDetail {
+					m.moveTraceDetail(m.traceScrollPageStep())
+				} else {
+					m.moveTraceCursor(m.traceScrollPageStep())
+				}
+				return nil
+			case "pgup", "pageup", "ctrl+b":
+				if m.traceView.Pane == tracePaneDetail {
+					m.moveTraceDetail(-m.traceScrollPageStep())
+				} else {
+					m.moveTraceCursor(-m.traceScrollPageStep())
 				}
 				return nil
 			case " ", "space":
@@ -1734,6 +1780,10 @@ func (m *model) toggleFocus() {
 	}
 }
 
+func (m *model) traceScrollPageStep() int {
+	return max(1, m.detail.Height/2)
+}
+
 func (m *model) cycleTraceTab(delta int) {
 	total := int(traceTabCards) + 1
 	next := (int(m.traceView.Tab) + delta + total) % total
@@ -1753,7 +1803,7 @@ func (m *model) setTracePane(pane tracePane) {
 	m.traceView.Pane = pane
 	switch pane {
 	case tracePaneDetail:
-		m.status = "trace: detail"
+		m.status = "trace detail; press h to return to tree"
 	default:
 		m.status = "trace: tree"
 	}
@@ -1769,7 +1819,7 @@ func (m *model) cycleTraceDetailTab(delta int) {
 	m.traceView.DetailTab = traceDetailTab(next)
 	m.traceView.Pane = tracePaneDetail
 	m.traceView.DetailOffset = 0
-	m.status = "trace detail: " + traceDetailTabLabel(m.traceView.DetailTab)
+	m.status = "trace detail: " + traceDetailTabLabel(m.traceView.DetailTab) + "; press h to return to tree"
 	m.updateDetail()
 }
 
@@ -1806,7 +1856,7 @@ func (m *model) setTraceEventPane(pane tracePane) {
 	m.traceView.EventPane = pane
 	switch pane {
 	case tracePaneDetail:
-		m.status = "events: detail"
+		m.status = "event detail; press h to return to stream"
 	default:
 		m.status = "events: stream"
 	}
@@ -1822,7 +1872,7 @@ func (m *model) cycleTraceEventTab(delta int) {
 	m.traceView.EventTab = traceEventTab(next)
 	m.traceView.EventPane = tracePaneDetail
 	m.traceView.EventOffset = 0
-	m.status = "event detail: " + traceEventTabLabel(m.traceView.EventTab)
+	m.status = "event detail: " + traceEventTabLabel(m.traceView.EventTab) + "; press h to return to stream"
 	m.updateDetail()
 }
 
@@ -1858,7 +1908,7 @@ func (m *model) setTraceCollectionPane(pane tracePane) {
 	m.traceView.CollectionPane = pane
 	switch pane {
 	case tracePaneDetail:
-		m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + ": detail"
+		m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail; press h to return to list"
 	default:
 		m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + ": list"
 	}
@@ -1874,7 +1924,7 @@ func (m *model) cycleTraceCollectionTab(delta int) {
 	m.traceView.CollectionTab = traceCollectionTab(next)
 	m.traceView.CollectionPane = tracePaneDetail
 	m.traceView.CollectionOffset = 0
-	m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail: " + traceCollectionTabLabel(m.traceView.CollectionTab)
+	m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail; press h to return to list"
 	m.updateDetail()
 }
 
@@ -1941,7 +1991,7 @@ func (m *model) openTraceCollectionItem() {
 	m.traceView.CollectionCursor = clamp(m.traceView.CollectionCursor, 0, len(collection.Rows)-1)
 	m.traceView.CollectionPane = tracePaneDetail
 	m.traceView.CollectionOffset = 0
-	m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail: " + traceCollectionTabLabel(m.traceView.CollectionTab)
+	m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail: " + traceCollectionTabLabel(m.traceView.CollectionTab) + "; press h to return to list"
 	m.updateDetail()
 }
 
@@ -1980,7 +2030,7 @@ func (m *model) openTraceEvent() {
 	m.traceView.EventCursor = clamp(m.traceView.EventCursor, 0, len(rows)-1)
 	m.traceView.EventPane = tracePaneDetail
 	m.traceView.EventOffset = 0
-	m.status = "event detail: " + traceEventTabLabel(m.traceView.EventTab)
+	m.status = "event detail; press h to return to stream"
 	m.updateDetail()
 }
 
@@ -2023,6 +2073,8 @@ func (m *model) toggleTraceNode() {
 	normalizeTraceCursor(&m.traceView, vm.Rows)
 	row := vm.Rows[m.traceView.Cursor]
 	if !row.HasKids {
+		delete(m.traceView.Expanded, row.NodeID)
+		m.traceView.SelectedID = row.NodeID
 		return
 	}
 	m.traceView.Expanded[row.NodeID] = !m.traceView.Expanded[row.NodeID]
@@ -2062,7 +2114,7 @@ func (m *model) openTraceNodeDetail(tab *traceDetailTab) {
 		m.traceView.DetailTab = *tab
 	}
 	m.traceView.DetailOffset = 0
-	m.status = "trace detail: " + traceDetailTabLabel(m.traceView.DetailTab)
+	m.status = "trace detail; press h to return to tree"
 	m.updateDetail()
 }
 

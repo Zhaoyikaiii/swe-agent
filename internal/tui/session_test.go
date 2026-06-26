@@ -570,12 +570,12 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Selected Detail",
 		"[Overview]  Output  Events  Debug",
 		"> [-] * Task  task  running",
-		"+-- [ ] + Go compile failed with import cycle...",
+		"+--  .  + Go compile failed with import cycle...",
 		"symptom  observed",
 		"+-- [-] + Resolve the Go import cycle  direction  supported",
-		"|   `-- [ ] + package service imports",
+		"|   `--  .  + package service imports",
 		"evidence  supports",
-		"`-- [ ] * Review  verify  running",
+		"`--  .  * Review  verify  running",
 		"What: Task",
 		"Status: running",
 		"Why: fix go test import cycle",
@@ -1412,6 +1412,84 @@ func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 	if model.traceView.Cursor != 1 {
 		t.Fatalf("expected j in tree pane to move cursor, got %d", model.traceView.Cursor)
+	}
+}
+
+func TestTraceWorkspacePageKeysScrollFocusedLists(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 140
+	model.height = 20
+	taskIndex := model.createTaskRecord(core.Task{Text: "inspect trace", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = scrollableTraceWorkspaceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+
+	model.traceView.Debug = true
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if model.traceView.Cursor <= 1 {
+		t.Fatalf("expected pgdown to move trace tree cursor by a page, got %d", model.traceView.Cursor)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgUp})
+	if model.traceView.Cursor != 0 {
+		t.Fatalf("expected pgup to move trace tree cursor back to top, got %d", model.traceView.Cursor)
+	}
+
+	model.setTraceTab("4")
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if model.traceView.EventCursor <= 1 {
+		t.Fatalf("expected pgdown to move event list cursor by a page, got %d", model.traceView.EventCursor)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgUp})
+	if model.traceView.EventCursor != 0 {
+		t.Fatalf("expected pgup to move event list cursor back to top, got %d", model.traceView.EventCursor)
+	}
+
+	model.setTraceTab("5")
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if model.traceView.CollectionCursor <= 1 {
+		t.Fatalf("expected pgdown to move collection list cursor by a page, got %d", model.traceView.CollectionCursor)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgUp})
+	if model.traceView.CollectionCursor != 0 {
+		t.Fatalf("expected pgup to move collection list cursor back to top, got %d", model.traceView.CollectionCursor)
+	}
+}
+
+func TestTraceWorkspaceDetailPaneKeysScrollDetailOnly(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 140
+	model.height = 14
+	taskIndex := model.createTaskRecord(core.Task{Text: "inspect trace", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = scrollableTraceWorkspaceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+
+	model.setTraceTab("4")
+	model.traceView.EventCursor = 35
+	model.traceView.EventPane = tracePaneDetail
+	model.traceView.EventTab = traceEventRaw
+	model.updateDetail()
+	cursor := model.traceView.EventCursor
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if model.traceView.EventCursor != cursor {
+		t.Fatalf("expected event detail scroll not to move event cursor, before=%d after=%d", cursor, model.traceView.EventCursor)
+	}
+	if model.traceView.EventOffset == 0 {
+		t.Fatalf("expected pgdown in event detail pane to scroll detail")
+	}
+
+	model.setTraceTab("5")
+	model.traceView.CollectionCursor = 1
+	model.traceView.CollectionPane = tracePaneDetail
+	model.traceView.CollectionTab = traceCollectionRaw
+	model.updateDetail()
+	cursor = model.traceView.CollectionCursor
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if model.traceView.CollectionCursor != cursor {
+		t.Fatalf("expected collection detail scroll not to move collection cursor, before=%d after=%d", cursor, model.traceView.CollectionCursor)
+	}
+	if model.traceView.CollectionOffset == 0 {
+		t.Fatalf("expected j in collection detail pane to scroll detail")
 	}
 }
 

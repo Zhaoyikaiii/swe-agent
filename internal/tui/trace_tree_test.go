@@ -33,6 +33,30 @@ func TestTraceTreeBuildsParentChildRows(t *testing.T) {
 	}
 }
 
+func TestTraceTreeLeafUsesNonToggleMarker(t *testing.T) {
+	nodes := []problemtrace.TraceNode{
+		{ID: "node-root", Kind: "problem", Title: "Problem"},
+		{ID: "node-leaf", ParentID: "node-root", Kind: "evidence", Title: "Leaf evidence", Status: "ok"},
+	}
+
+	vm := buildTraceTreeVM(nodes)
+	rows := flattenTraceTree(vm, map[string]bool{
+		"node-root": true,
+		"node-leaf": true,
+	})
+	got := renderTraceTreeASCII(rows, traceWorkspaceState{Cursor: 1}, 100)
+
+	if rows[1].Expanded {
+		t.Fatalf("expected leaf row not to be expanded, got %#v", rows[1])
+	}
+	if strings.Contains(got, "[ ]") {
+		t.Fatalf("expected leaf marker not to look toggleable, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".  + Leaf evidence") {
+		t.Fatalf("expected leaf marker dot, got:\n%s", got)
+	}
+}
+
 func TestTraceTreeWeakensGenericObservationDirection(t *testing.T) {
 	nodes := []problemtrace.TraceNode{
 		{ID: "node-root", Kind: "problem", Title: "Problem", Status: "running"},
@@ -300,7 +324,7 @@ func TestTraceDetailDebugShowsRawCommand(t *testing.T) {
 		},
 	}
 
-	rendered := traceWorkspaceView(record, state, 120, 18, "trace.jsonl")
+	rendered := traceWorkspaceView(record, state, 120, 40, "trace.jsonl")
 
 	if !strings.Contains(rendered, "Raw command:") || !strings.Contains(rendered, "go test ./internal/tui -run TestTrace") {
 		t.Fatalf("expected debug detail to show raw command, got:\n%s", rendered)
@@ -353,6 +377,35 @@ func TestTraceCursorMovesWithinRows(t *testing.T) {
 	}
 	if m.traceView.SelectedID != "node-child" {
 		t.Fatalf("expected selected node-child, got %q", m.traceView.SelectedID)
+	}
+}
+
+func TestTraceLeafNodeDoesNotToggleExpansionState(t *testing.T) {
+	m := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	m.detail.Width = 100
+	taskIndex := m.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Time{})
+	m.tasks[taskIndex].Events = []core.Event{
+		traceNodeEvent(problemtrace.TraceNode{ID: "node-root", Kind: "problem", Title: "Problem"}),
+		traceNodeEvent(problemtrace.TraceNode{ID: "node-child", ParentID: "node-root", Kind: "direction", Title: "Child"}),
+	}
+	m.setSelectedTask(taskIndex)
+	m.view = viewTrace
+	m.traceView = traceWorkspaceState{
+		Tab: traceTabTrace,
+		Expanded: map[string]bool{
+			"node-root":  true,
+			"node-child": true,
+		},
+	}
+
+	m.moveTraceCursor(1)
+	m.toggleTraceNode()
+
+	if _, ok := m.traceView.Expanded["node-child"]; ok {
+		t.Fatalf("expected leaf node expansion state to be removed, got %#v", m.traceView.Expanded)
+	}
+	if m.traceView.SelectedID != "node-child" {
+		t.Fatalf("expected leaf node to stay selected, got %q", m.traceView.SelectedID)
 	}
 }
 

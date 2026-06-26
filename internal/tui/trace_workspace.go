@@ -485,7 +485,7 @@ func renderTraceCollectionList(collection TraceCollectionVM, cursor int, width i
 	title := collection.Title
 	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
-	b.WriteString("j/k move  h/l focus  enter/o detail  [/] detail  D debug\n\n")
+	b.WriteString("j/k move  pg scroll  l detail  o open  [/] tabs  D debug\n\n")
 
 	if len(collection.Rows) == 0 {
 		b.WriteString(collection.Empty)
@@ -530,6 +530,7 @@ func renderTraceCollectionDetail(collection TraceCollectionVM, row TraceCollecti
 	title := collection.DetailTitle
 	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
+	b.WriteString("j/k scroll  pg page  h list  [/] tabs\n")
 	b.WriteString(traceCollectionTabs(tab))
 	b.WriteString("\n\n")
 
@@ -1025,7 +1026,7 @@ func renderTraceEventList(rows []TraceEventRowVM, cursor int, width int, active 
 	title := "Event Stream"
 	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
-	b.WriteString("j/k move  h/l focus  enter/o detail  [/] detail  D debug\n\n")
+	b.WriteString("j/k move  pg scroll  l detail  o open  [/] tabs  D debug\n\n")
 
 	if len(rows) == 0 {
 		b.WriteString("No key events recorded.\n")
@@ -1104,6 +1105,7 @@ func renderTraceEventDetail(row TraceEventRowVM, tab traceEventTab, width int, a
 	title := "Selected Event"
 	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
+	b.WriteString("j/k scroll  pg page  h stream  [/] tabs\n")
 	b.WriteString(traceEventTabs(tab))
 	b.WriteString("\n\n")
 

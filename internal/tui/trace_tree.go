@@ -181,7 +181,7 @@ func flattenTraceTree(vm TraceTreeVM, expanded map[string]bool) []TraceTreeRow {
 			return
 		}
 		hasKids := len(node.Children) > 0
-		isExpanded := expanded[id]
+		isExpanded := hasKids && expanded[id]
 		rows = append(rows, TraceTreeRow{
 			NodeID:    node.ID,
 			Depth:     depth,
@@ -296,9 +296,9 @@ func renderTraceTreeASCIIOptions(rows []TraceTreeRow, state traceWorkspaceState,
 	b.WriteString(renderTracePaneTitle(title, !inlineSummary && state.Pane == tracePaneTree))
 	b.WriteByte('\n')
 	if inlineSummary {
-		b.WriteString("j/k move  space fold  enter/o detail  O output  tab switch tab\n\n")
+		b.WriteString("j/k move  pg scroll  space fold  o detail  O output  tab tabs\n\n")
 	} else {
-		b.WriteString("j/k move  space fold  h/l focus  enter/o detail  O output\n\n")
+		b.WriteString("j/k move  pg scroll  space fold  l detail  o open  O output\n\n")
 	}
 
 	if len(rows) == 0 {
@@ -313,16 +313,7 @@ func renderTraceTreeASCIIOptions(rows []TraceTreeRow, state traceWorkspaceState,
 			selection = "> "
 		}
 
-		twisty := "[ ]"
-		if row.HasKids {
-			if row.Expanded {
-				twisty = "[-]"
-			} else {
-				twisty = "[+]"
-			}
-		}
-
-		line := formatTraceTreeLine(row, selection, twisty, width)
+		line := formatTraceTreeLine(row, selection, traceTreeMarker(row), width)
 		line = truncate(line, width)
 		if i == cursor {
 			line = traceSelectedStyle.Width(width).Render(line)
@@ -340,8 +331,18 @@ func renderTraceTreeASCIIOptions(rows []TraceTreeRow, state traceWorkspaceState,
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
-func formatTraceTreeLine(row TraceTreeRow, selection string, twisty string, width int) string {
-	prefix := fmt.Sprintf("%s%s%s%s %s ", selection, row.Prefix, row.Connector, twisty, traceStatusASCII(row.Status))
+func traceTreeMarker(row TraceTreeRow) string {
+	if !row.HasKids {
+		return " . "
+	}
+	if row.Expanded {
+		return "[-]"
+	}
+	return "[+]"
+}
+
+func formatTraceTreeLine(row TraceTreeRow, selection string, marker string, width int) string {
+	prefix := fmt.Sprintf("%s%s%s%s %s ", selection, row.Prefix, row.Connector, marker, traceStatusASCII(row.Status))
 	title := displayTraceRowTitle(row)
 	suffix := ""
 	if kind := displayTraceKindLabel(row.Kind, row.NodeID, row.Title); kind != "" {
@@ -428,6 +429,7 @@ func renderTraceDetailPanel(vm TraceWorkspaceVM, state traceWorkspaceState, widt
 	title := "Selected Detail"
 	b.WriteString(renderTracePaneTitle(title, state.Pane == tracePaneDetail))
 	b.WriteByte('\n')
+	b.WriteString("j/k scroll  pg page  h tree  [/] tabs\n")
 
 	row, node, ok := selectedTraceNode(vm, state)
 	if !ok {
