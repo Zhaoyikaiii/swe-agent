@@ -228,10 +228,79 @@ func narrativeStep(event core.Event, eventIndex int) int {
 func actionTitle(tool string, command string) string {
 	tool = valueOrDefault(tool, "tool")
 	command = strings.TrimSpace(command)
+	if title := classifyToolAction(tool, command); title != "" {
+		return title
+	}
 	if command == "" {
 		return tool
 	}
 	return fmt.Sprintf("%s: %s", tool, shortString(command, 120))
+}
+
+func classifyToolAction(tool string, command string) string {
+	tool = strings.ToLower(strings.TrimSpace(tool))
+	command = strings.TrimSpace(command)
+	lowerCommand := strings.ToLower(command)
+
+	if strings.Contains(tool, "apply_patch") {
+		return "Apply patch"
+	}
+	if command == "" {
+		return ""
+	}
+	if strings.Contains(lowerCommand, "gh api") && strings.Contains(lowerCommand, "reviewthreads") {
+		return "Fetch unresolved PR review threads"
+	}
+	if strings.Contains(lowerCommand, "gh pr view") {
+		return "Read PR metadata"
+	}
+	if strings.Contains(lowerCommand, "git status") {
+		return "Check working tree status"
+	}
+	if strings.Contains(lowerCommand, "git diff") {
+		return "Review local diff"
+	}
+	if strings.Contains(lowerCommand, "git apply") || strings.Contains(lowerCommand, "apply_patch") {
+		return "Apply patch"
+	}
+	if commandLooksLikeVerification(lowerCommand) {
+		return "Run verification"
+	}
+	if commandLooksLikeCodeInspection(lowerCommand) {
+		return "Inspect referenced code"
+	}
+	if strings.HasPrefix(lowerCommand, "rg --files") {
+		return "List repository files"
+	}
+	if strings.HasPrefix(lowerCommand, "rg ") || strings.Contains(lowerCommand, " rg ") {
+		return "Search codebase"
+	}
+	return ""
+}
+
+func commandLooksLikeVerification(command string) bool {
+	patterns := []string{
+		"go test",
+		"pytest",
+		"cargo test",
+		"npm test",
+		"npm run test",
+		"pnpm test",
+		"yarn test",
+		"make test",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(command, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandLooksLikeCodeInspection(command string) bool {
+	return strings.Contains(command, "path(") && strings.Contains(command, "read_text") ||
+		strings.Contains(command, "sed -n") ||
+		strings.Contains(command, "nl -ba")
 }
 
 func actionSummary(tool string, command string, note string) string {

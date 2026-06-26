@@ -1538,6 +1538,24 @@ func (m *model) moveTraceDetail(delta int) {
 	m.updateDetail()
 }
 
+func (m *model) clampTraceDetailOffset() {
+	if m.view != viewTrace || m.traceView.Tab != traceTabTrace {
+		return
+	}
+	if m.traceView.DetailOffset <= 0 {
+		m.traceView.DetailOffset = 0
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		m.traceView.DetailOffset = 0
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	maxOffset := traceDetailMaxOffset(vm, m.traceView, m.detail.Width, m.detail.Height)
+	m.traceView.DetailOffset = clamp(m.traceView.DetailOffset, 0, maxOffset)
+}
+
 func (m *model) moveTraceCursor(delta int) {
 	if m.traceView.Tab != traceTabTrace {
 		return
@@ -1881,6 +1899,7 @@ func (m *model) sidebarListHeight() int {
 
 func (m *model) updateDetail() {
 	m.syncDetailSize()
+	m.clampTraceDetailOffset()
 	m.detail.SetContent(m.detailContent())
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/local/swe-agent/internal/core"
 	"github.com/local/swe-agent/internal/problemtrace"
 )
 
@@ -13,6 +14,7 @@ type TraceWorkspaceVM struct {
 	Tree           TraceTreeVM
 	Rows           []TraceTreeRow
 	Selected       *TraceTreeNodeVM
+	Events         []core.Event
 	TrajectoryPath string
 }
 
@@ -98,6 +100,7 @@ func buildTraceWorkspaceVM(record taskRecord, state traceWorkspaceState, traject
 		Tree:           tree,
 		Rows:           rows,
 		Selected:       selected,
+		Events:         append([]core.Event(nil), record.Events...),
 		TrajectoryPath: trajectoryPath,
 	}
 }
@@ -222,7 +225,7 @@ func flattenTraceTree(vm TraceTreeVM, expanded map[string]bool) []TraceTreeRow {
 func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int, record taskRecord) {
 	trace := vm.Trace
 	snapshot := BuildRunSnapshot(record, vm.TrajectoryPath)
-	writeField(b, "Task", shortString(trace.Problem.UserTask, 120), width)
+	writeField(b, "Task", shortString(trace.Problem.UserTask, 100), width)
 	writeField(b, "Status", narrativeRunStatus(record, trace), width)
 	writeField(b, "Validation", validationSummary(snapshot), width)
 	if snapshot.FinalReview.ChangedFiles > 0 {
@@ -232,7 +235,7 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 		writeField(b, "Active", active, width)
 	}
 	if trace.Problem.ErrorSummary != "" {
-		writeField(b, "Symptom", trace.Problem.ErrorSummary, width)
+		writeField(b, "Symptom", shortString(trace.Problem.ErrorSummary, 100), width)
 	}
 	if state.Debug {
 		writeSection(b, "Debug")
@@ -336,32 +339,55 @@ func formatTraceTreeLine(row TraceTreeRow, selection string, twisty string, widt
 }
 
 func renderTraceSplit(vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int) string {
-	gap := 2
+	gap := 3
+	leftWidth, rightWidth := traceSplitWidths(width, gap)
+
+	left := renderTraceTreePanel(vm, state, leftWidth)
+	right := renderTraceDetailPanel(vm, state, rightWidth)
+
+	panelHeight := traceSplitPanelHeight(left, right, height)
+
+	left = fitTraceTreeAroundCursor(left, panelHeight, traceCursorForRows(state, vm.Rows))
+	right = fitHeightOffset(right, panelHeight, state.DetailOffset)
+	divider := mutedStyle.Width(1).Render("|")
+
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Render(left),
+		" ",
+		divider,
+		" ",
+		lipgloss.NewStyle().Width(rightWidth).Render(right),
+	)
+}
+
+func traceSplitWidths(width int, gap int) (int, int) {
 	leftWidth := max(48, width*58/100)
 	rightWidth := max(36, width-leftWidth-gap)
 	if leftWidth+gap+rightWidth > width {
 		leftWidth = max(36, width-gap-rightWidth)
 	}
+	return leftWidth, rightWidth
+}
 
-	left := renderTraceTreePanel(vm, state, leftWidth)
-	right := renderTraceDetailPanel(vm, state, rightWidth)
-
-	leftHeight := lipgloss.Height(left)
-	rightHeight := lipgloss.Height(right)
-	panelHeight := max(leftHeight, rightHeight)
+func traceSplitPanelHeight(left string, right string, height int) int {
+	panelHeight := max(lipgloss.Height(left), lipgloss.Height(right))
 	if height > 0 {
 		panelHeight = min(panelHeight, max(8, height-8))
 	}
+	return panelHeight
+}
 
-	left = fitHeight(left, panelHeight)
-	right = fitHeightOffset(right, panelHeight, state.DetailOffset)
-
-	return lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		lipgloss.NewStyle().Width(leftWidth).Render(left),
-		strings.Repeat(" ", gap),
-		lipgloss.NewStyle().Width(rightWidth).Render(right),
-	)
+func traceDetailMaxOffset(vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int) int {
+	if width < 120 {
+		return 0
+	}
+	const gap = 3
+	leftWidth, rightWidth := traceSplitWidths(width, gap)
+	left := renderTraceTreePanel(vm, state, leftWidth)
+	right := renderTraceDetailPanel(vm, state, rightWidth)
+	panelHeight := traceSplitPanelHeight(left, right, height)
+	return max(0, lipgloss.Height(right)-panelHeight)
 }
 
 func fitHeightOffset(content string, height int, offset int) string {
@@ -385,6 +411,36 @@ func fitHeightOffset(content string, height int, offset int) string {
 	return strings.Join(lines, "\n")
 }
 
+func fitTraceTreeAroundCursor(content string, height int, cursor int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) <= height {
+		return fitHeight(content, height)
+	}
+
+	headerLines := min(3, len(lines))
+	bodyHeight := height - headerLines
+	if bodyHeight <= 0 {
+		return fitHeight(content, height)
+	}
+
+	body := lines[headerLines:]
+	if len(body) <= bodyHeight {
+		return fitHeight(content, height)
+	}
+
+	bodyCursor := clamp(cursor, 0, len(body)-1)
+	start := clamp(bodyCursor-bodyHeight/2, 0, max(0, len(body)-bodyHeight))
+	out := append([]string{}, lines[:headerLines]...)
+	out = append(out, body[start:min(len(body), start+bodyHeight)]...)
+	for len(out) < height {
+		out = append(out, "")
+	}
+	return strings.Join(out, "\n")
+}
+
 func renderTraceTreePanel(vm TraceWorkspaceVM, state traceWorkspaceState, width int) string {
 	return renderTraceTreeASCIIOptions(vm.Rows, state, width, false)
 }
@@ -397,27 +453,41 @@ func renderTraceDetailPanel(vm TraceWorkspaceVM, state traceWorkspaceState, widt
 	}
 	b.WriteString(title)
 	b.WriteByte('\n')
-	b.WriteString(traceDetailTabs(state.DetailTab))
-	b.WriteString("\n\n")
 
 	row, node, ok := selectedTraceNode(vm, state)
 	if !ok {
+		b.WriteString(traceDetailTabs(state.DetailTab))
+		b.WriteString("\n\n")
 		b.WriteString("No node selected.\n")
 		return b.String()
 	}
 
-	switch state.DetailTab {
+	activeTab := effectiveTraceDetailTab(state, node)
+	b.WriteString(traceDetailTabs(activeTab))
+	b.WriteString("\n\n")
+
+	switch activeTab {
 	case traceDetailOutput:
 		renderTraceDetailOutput(&b, row, node, vm, width)
 	case traceDetailEvents:
 		renderTraceDetailEvents(&b, row, node, width)
 	case traceDetailDebug:
-		renderTraceDetailDebug(&b, row, node, width)
+		renderTraceDetailDebug(&b, row, node, vm, width)
 	default:
 		renderTraceDetailOverview(&b, row, node, vm, width)
 	}
 
 	return b.String()
+}
+
+func effectiveTraceDetailTab(state traceWorkspaceState, node TraceTreeNodeVM) traceDetailTab {
+	if state.DetailTab != traceDetailOverview {
+		return state.DetailTab
+	}
+	if strings.EqualFold(strings.TrimSpace(node.Kind), "action") && traceStatusIsFailure(node.Status) {
+		return traceDetailOutput
+	}
+	return state.DetailTab
 }
 
 func traceDetailTabs(active traceDetailTab) string {
@@ -538,25 +608,45 @@ func renderTraceDetailEvents(b *strings.Builder, row TraceTreeRow, node TraceTre
 	b.WriteString("\nPress 4 to open the Events tab for raw event details.\n")
 }
 
-func renderTraceDetailDebug(b *strings.Builder, row TraceTreeRow, node TraceTreeNodeVM, width int) {
-	writeField(b, "ID", node.ID, width)
-	writeField(b, "Kind", node.Kind, width)
-	writeField(b, "Status", node.Status, width)
-	writeField(b, "Title", node.Title, width)
-	writeField(b, "Summary", node.Summary, width)
-	writeField(b, "Direction", node.DirectionID, width)
-	writeField(b, "Prompt", node.PromptID, width)
-
+func renderTraceDetailDebug(b *strings.Builder, row TraceTreeRow, node TraceTreeNodeVM, vm TraceWorkspaceVM, width int) {
 	eventIDs := node.EventIDs
 	if len(eventIDs) == 0 {
 		eventIDs = row.EventIDs
 	}
+
+	writeField(b, "ID", node.ID, width)
+	writeField(b, "Kind", node.Kind, width)
+	writeField(b, "Status", node.Status, width)
+	writeField(b, "Title", node.Title, width)
+	if command := rawCommandForTraceNode(vm, eventIDs); command != "" {
+		writeField(b, "Raw command", command, width)
+	}
+	writeField(b, "Summary", node.Summary, width)
+	writeField(b, "Direction", node.DirectionID, width)
+	writeField(b, "Prompt", node.PromptID, width)
+
 	if len(eventIDs) > 0 {
 		writeField(b, "Events", formatEventIDs(eventIDs), width)
 	}
 	if len(node.Children) > 0 {
 		writeField(b, "Children", len(node.Children), width)
 	}
+}
+
+func rawCommandForTraceNode(vm TraceWorkspaceVM, eventIDs []int) string {
+	for _, eventID := range eventIDs {
+		if eventID < 0 || eventID >= len(vm.Events) {
+			continue
+		}
+		event := vm.Events[eventID]
+		if event.Type != "tool_call" {
+			continue
+		}
+		if command := commandFromArgs(event.Data["args"]); command != "" {
+			return command
+		}
+	}
+	return ""
 }
 
 func firstChildOfKind(vm TraceWorkspaceVM, parentID string, kind string) *TraceTreeNodeVM {
@@ -704,6 +794,15 @@ func traceStatusASCII(status string) string {
 		return "o"
 	default:
 		return "."
+	}
+}
+
+func traceStatusIsFailure(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "error", "failed", "failure", "refuted", "timeout", "blocked":
+		return true
+	default:
+		return false
 	}
 }
 

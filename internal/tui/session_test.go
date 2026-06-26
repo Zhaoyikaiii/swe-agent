@@ -998,8 +998,8 @@ func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
 	}
 
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
-	if model.traceView.DetailOffset != 1 {
-		t.Fatalf("expected j in detail pane to scroll detail, got offset=%d", model.traceView.DetailOffset)
+	if model.traceView.DetailOffset != 0 {
+		t.Fatalf("expected short detail pane to keep clamped offset=0, got %d", model.traceView.DetailOffset)
 	}
 
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
@@ -1009,6 +1009,42 @@ func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 	if model.traceView.Cursor != 1 {
 		t.Fatalf("expected j in tree pane to move cursor, got %d", model.traceView.Cursor)
+	}
+}
+
+func TestTraceWorkspaceDetailOffsetClampsToRenderedContent(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 140
+	model.height = 18
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix failing tests", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = []core.Event{
+		{Type: "user_task", Data: map[string]any{"task": "fix failing tests", "repo": "/repo"}},
+		{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "go test ./..."}}},
+		{Type: "tool_result", Data: map[string]any{
+			"tool":           "shell",
+			"code":           1,
+			"output_preview": strings.Repeat("failure output ", 40),
+		}},
+	}
+	model.setSelectedTask(taskIndex)
+	model.view = viewTrace
+	model.traceView = traceWorkspaceState{
+		Tab:          traceTabTrace,
+		Pane:         tracePaneDetail,
+		DetailTab:    traceDetailOutput,
+		SelectedID:   "node-action-1",
+		DetailOffset: 999,
+		Expanded: map[string]bool{
+			"node-root": true,
+		},
+	}
+
+	model.updateDetail()
+
+	vm := buildTraceWorkspaceVM(model.tasks[taskIndex], model.traceView, model.trajectoryPath())
+	maxOffset := traceDetailMaxOffset(vm, model.traceView, model.detail.Width, model.detail.Height)
+	if model.traceView.DetailOffset > maxOffset {
+		t.Fatalf("expected offset <= max rendered offset %d, got %d", maxOffset, model.traceView.DetailOffset)
 	}
 }
 
