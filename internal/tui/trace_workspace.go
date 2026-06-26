@@ -306,9 +306,16 @@ func buildTraceMemoryCollection(trace problemtrace.ProblemTrace, debug bool) Tra
 	return TraceCollectionVM{
 		Title:       "Memory Sources",
 		DetailTitle: "Selected Memory",
-		Empty:       "No memory used in this run.",
+		Empty:       traceMemoryEmptyMessage(debug),
 		Rows:        rows,
 	}
+}
+
+func traceMemoryEmptyMessage(debug bool) string {
+	if debug {
+		return "No memory used in this run."
+	}
+	return "No memory surfaced for this run. Press D for debug policy context."
 }
 
 func buildTracePromptCollection(trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
@@ -317,7 +324,7 @@ func buildTracePromptCollection(trace problemtrace.ProblemTrace, debug bool) Tra
 		return TraceCollectionVM{
 			Title:       "Prompt Context",
 			DetailTitle: "Selected Prompt",
-			Empty:       "No prompt snapshots recorded.",
+			Empty:       tracePromptEmptyMessage(debug),
 		}
 	}
 
@@ -390,9 +397,16 @@ func buildTracePromptCollection(trace problemtrace.ProblemTrace, debug bool) Tra
 	return TraceCollectionVM{
 		Title:       "Prompt Context",
 		DetailTitle: "Selected Prompt",
-		Empty:       "No prompt snapshots recorded.",
+		Empty:       tracePromptEmptyMessage(debug),
 		Rows:        rows,
 	}
+}
+
+func tracePromptEmptyMessage(debug bool) string {
+	if debug {
+		return "No prompt snapshots recorded."
+	}
+	return "No prompt snapshot surfaced for this run. Press D for raw prompt/debug context."
 }
 
 func buildTraceLearnCollection(trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
@@ -442,7 +456,10 @@ func renderTraceCollectionWorkspace(b *strings.Builder, collection TraceCollecti
 
 	var right string
 	if len(collection.Rows) == 0 {
-		right = collection.DetailTitle + "\n\nNo item selected.\n"
+		right = collection.DetailTitle + "\n\n" + collection.Empty
+		if !strings.HasSuffix(right, "\n") {
+			right += "\n"
+		}
 	} else {
 		right = renderTraceCollectionDetail(collection, collection.Rows[cursor], state.CollectionTab, rightWidth, state.CollectionPane == tracePaneDetail)
 	}
@@ -450,16 +467,8 @@ func renderTraceCollectionWorkspace(b *strings.Builder, collection TraceCollecti
 	panelHeight := traceEventSplitPanelHeight(left, right, height)
 	left = fitEventListAroundCursor(left, panelHeight, cursor)
 	right = fitHeightOffset(right, panelHeight, state.CollectionOffset)
-	divider := mutedStyle.Width(1).Render("|")
 
-	b.WriteString(lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		lipgloss.NewStyle().Width(leftWidth).Render(left),
-		" ",
-		divider,
-		" ",
-		lipgloss.NewStyle().Width(rightWidth).Render(right),
-	))
+	b.WriteString(renderSplitPanels(left, right, leftWidth, rightWidth))
 }
 
 func renderTraceCollectionListOnly(b *strings.Builder, collection TraceCollectionVM, cursor int, width int, height int) {
@@ -479,7 +488,7 @@ func renderTraceCollectionList(collection TraceCollectionVM, cursor int, width i
 	}
 	b.WriteString(title)
 	b.WriteByte('\n')
-	b.WriteString("j/k move  h/l focus  [/] detail  d debug\n\n")
+	b.WriteString("j/k move  h/l focus  enter/o detail  [/] detail  D debug\n\n")
 
 	if len(collection.Rows) == 0 {
 		b.WriteString(collection.Empty)
@@ -745,6 +754,7 @@ type indexedEvent struct {
 
 type TraceEventRowVM struct {
 	Index   int
+	Step    int
 	Type    string
 	Kind    string
 	Icon    string
@@ -766,7 +776,75 @@ func buildTraceEventRows(events []core.Event, debug bool) []TraceEventRowVM {
 	for _, item := range items {
 		rows = append(rows, projectTraceEvent(item))
 	}
+	inferTraceEventSteps(rows)
 	return rows
+}
+
+func inferTraceEventSteps(rows []TraceEventRowVM) {
+	currentStep := 0
+	openActionStep := 0
+	stepOpen := false
+	for i := range rows {
+		explicitStep := traceEventExplicitStep(rows[i].Event)
+		if explicitStep > 0 {
+			rows[i].Step = explicitStep
+			currentStep = max(currentStep, explicitStep)
+			switch rows[i].Type {
+			case "tool_call", "tool_proposed":
+				openActionStep = explicitStep
+				stepOpen = true
+			case "tool_result", "tool_denied":
+				openActionStep = 0
+				stepOpen = false
+			}
+			continue
+		}
+
+		switch rows[i].Type {
+		case "model_request":
+			currentStep++
+			rows[i].Step = currentStep
+			stepOpen = true
+		case "model_response":
+			if currentStep == 0 || !stepOpen {
+				currentStep++
+			}
+			rows[i].Step = currentStep
+			stepOpen = true
+		case "tool_proposed", "tool_call":
+			if currentStep == 0 || !stepOpen {
+				currentStep++
+			}
+			rows[i].Step = currentStep
+			openActionStep = currentStep
+			stepOpen = true
+		case "tool_result", "tool_denied":
+			if openActionStep > 0 {
+				rows[i].Step = openActionStep
+			} else {
+				if currentStep == 0 {
+					currentStep++
+				}
+				rows[i].Step = currentStep
+			}
+			openActionStep = 0
+			stepOpen = false
+		case "symptom_detected", "direction_created", "direction_updated", "evidence_added", "prompt_snapshot", "frontier_updated", "memory_card_generated":
+			if currentStep > 0 {
+				rows[i].Step = currentStep
+			}
+		}
+	}
+}
+
+func traceEventExplicitStep(event core.Event) int {
+	if step := intValue(event.Data["step"]); step > 0 {
+		return step
+	}
+	if snapshot, ok := normalizeValue(event.Data["snapshot"]).(map[string]any); ok {
+		return intValue(snapshot["step"])
+	}
+	return 0
 }
 
 func projectTraceEvent(item indexedEvent) TraceEventRowVM {
@@ -933,25 +1011,17 @@ func renderTraceEventsWorkspace(b *strings.Builder, events []core.Event, state t
 	}
 
 	panelHeight := traceEventSplitPanelHeight(left, right, height)
-	left = fitEventListAroundCursor(left, panelHeight, cursor)
+	left = fitEventListAroundCursor(left, panelHeight, traceEventDisplayCursor(rows, cursor))
 	right = fitHeightOffset(right, panelHeight, state.EventOffset)
-	divider := mutedStyle.Width(1).Render("|")
 
-	b.WriteString(lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		lipgloss.NewStyle().Width(leftWidth).Render(left),
-		" ",
-		divider,
-		" ",
-		lipgloss.NewStyle().Width(rightWidth).Render(right),
-	))
+	b.WriteString(renderSplitPanels(left, right, leftWidth, rightWidth))
 }
 
 func renderTraceEventListOnly(b *strings.Builder, rows []TraceEventRowVM, cursor int, width int, height int) {
 	cursor = traceEventCursorForRows(traceWorkspaceState{EventCursor: cursor}, rows)
 	content := renderTraceEventList(rows, cursor, width, true)
 	if height > 0 {
-		content = fitEventListAroundCursor(content, max(8, height-4), cursor)
+		content = fitEventListAroundCursor(content, max(8, height-4), traceEventDisplayCursor(rows, cursor))
 	}
 	b.WriteString(content)
 }
@@ -964,7 +1034,7 @@ func renderTraceEventList(rows []TraceEventRowVM, cursor int, width int, active 
 	}
 	b.WriteString(title)
 	b.WriteByte('\n')
-	b.WriteString("j/k move  h/l focus  [/] detail  d debug\n\n")
+	b.WriteString("j/k move  h/l focus  enter/o detail  [/] detail  D debug\n\n")
 
 	if len(rows) == 0 {
 		b.WriteString("No key events recorded.\n")
@@ -972,7 +1042,14 @@ func renderTraceEventList(rows []TraceEventRowVM, cursor int, width int, active 
 	}
 
 	cursor = clamp(cursor, 0, len(rows)-1)
+	lastGroup := ""
 	for i, row := range rows {
+		if group := traceEventGroupLabel(row); group != "" && group != lastGroup {
+			b.WriteString(mutedStyle.Render(group))
+			b.WriteByte('\n')
+			lastGroup = group
+		}
+
 		prefix := "  "
 		if i == cursor {
 			prefix = "> "
@@ -999,6 +1076,36 @@ func renderTraceEventList(rows []TraceEventRowVM, cursor int, width int, active 
 	}
 
 	return b.String()
+}
+
+func traceEventGroupLabel(row TraceEventRowVM) string {
+	if row.Step > 0 {
+		return fmt.Sprintf("Step %d", row.Step)
+	}
+	if row.Kind == "final" {
+		return "Final"
+	}
+	return ""
+}
+
+func traceEventDisplayCursor(rows []TraceEventRowVM, cursor int) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	cursor = clamp(cursor, 0, len(rows)-1)
+	line := 0
+	lastGroup := ""
+	for i, row := range rows {
+		if group := traceEventGroupLabel(row); group != "" && group != lastGroup {
+			line++
+			lastGroup = group
+		}
+		if i == cursor {
+			return line
+		}
+		line++
+	}
+	return line
 }
 
 func renderTraceEventDetail(row TraceEventRowVM, tab traceEventTab, width int, active bool) string {
@@ -1030,6 +1137,9 @@ func renderTraceEventOverview(b *strings.Builder, row TraceEventRowVM, width int
 	writeField(b, "Event", fmt.Sprintf("#%d %s", row.Index+1, row.Type), width)
 	if !row.Event.Time.IsZero() {
 		writeField(b, "Time", row.Event.Time.Format("2006-01-02 15:04:05"), width)
+	}
+	if row.Step > 0 {
+		writeField(b, "Step", row.Step, width)
 	}
 	writeField(b, "Kind", row.Kind, width)
 	writeField(b, "Status", row.Status, width)
@@ -1074,6 +1184,57 @@ func renderTraceEventOverview(b *strings.Builder, row TraceEventRowVM, width int
 		writeField(b, "Steps", row.Event.Data["steps"], width)
 		writeField(b, "Submission", row.Event.Data["submission"], width)
 	}
+	renderTraceEventRelated(b, row, width)
+}
+
+func renderTraceEventRelated(b *strings.Builder, row TraceEventRowVM, width int) {
+	fields := []struct {
+		key   string
+		value any
+	}{}
+	add := func(key string, value any) {
+		if strings.TrimSpace(fmt.Sprint(value)) == "" {
+			return
+		}
+		fields = append(fields, struct {
+			key   string
+			value any
+		}{key, value})
+	}
+	if tc, ok := traceEventContext(row.Event); ok {
+		add("Trace ID", tc.TraceID)
+		add("Span", tc.SpanID)
+		add("Parent Span", tc.ParentSpanID)
+		add("Direction", tc.DirectionID)
+		add("Prompt", tc.PromptSnapshotID)
+		if len(tc.MemoryIDs) > 0 {
+			add("Memories", strings.Join(tc.MemoryIDs, ", "))
+		}
+	} else if traceID := traceEventText(row.Event.Data["trace_id"]); traceID != "" {
+		add("Trace ID", traceID)
+	}
+	if directionID := traceEventText(row.Event.Data["direction_id"]); directionID != "" {
+		add("Direction", directionID)
+	}
+	if promptID := traceEventText(row.Event.Data["prompt_snapshot_id"]); promptID != "" {
+		add("Prompt", promptID)
+	}
+
+	if len(fields) == 0 {
+		return
+	}
+	writeSection(b, "Related")
+	for _, field := range fields {
+		writeField(b, field.key, field.value, width)
+	}
+}
+
+func traceEventContext(event core.Event) (problemtrace.TraceContext, bool) {
+	var tc problemtrace.TraceContext
+	if problemtraceDecode(event.Data["trace_context"], &tc) {
+		return tc, true
+	}
+	return problemtrace.TraceContext{}, false
 }
 
 func renderTraceEventData(b *strings.Builder, row TraceEventRowVM, width int) {
@@ -1085,8 +1246,7 @@ func renderTraceEventData(b *strings.Builder, row TraceEventRowVM, width int) {
 }
 
 func renderTraceEventTrace(b *strings.Builder, row TraceEventRowVM, width int) {
-	var tc problemtrace.TraceContext
-	if problemtraceDecode(row.Event.Data["trace_context"], &tc) {
+	if tc, ok := traceEventContext(row.Event); ok {
 		writeSection(b, "Trace Context")
 		writeField(b, "Trace ID", tc.TraceID, width)
 		writeField(b, "Span ID", tc.SpanID, width)
@@ -1157,20 +1317,11 @@ func traceEventTabLabel(tab traceEventTab) string {
 }
 
 func traceEventSplitWidths(width int, gap int) (int, int) {
-	leftWidth := max(52, width*55/100)
-	rightWidth := max(40, width-leftWidth-gap)
-	if leftWidth+gap+rightWidth > width {
-		leftWidth = max(40, width-gap-rightWidth)
-	}
-	return leftWidth, rightWidth
+	return splitPanelWidths(width, gap, 55, 52, 40)
 }
 
 func traceEventSplitPanelHeight(left string, right string, height int) int {
-	panelHeight := max(lipgloss.Height(left), lipgloss.Height(right))
-	if height > 0 {
-		panelHeight = min(panelHeight, max(8, height-4))
-	}
-	return panelHeight
+	return splitPanelHeight(left, right, height, 4)
 }
 
 func traceEventDetailMaxOffset(events []core.Event, state traceWorkspaceState, width int, height int) int {
@@ -1198,33 +1349,7 @@ func traceEventCursorForRows(state traceWorkspaceState, rows []TraceEventRowVM) 
 }
 
 func fitEventListAroundCursor(content string, height int, cursor int) string {
-	if height <= 0 {
-		return ""
-	}
-	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
-	if len(lines) <= height {
-		return fitHeight(content, height)
-	}
-
-	headerLines := min(3, len(lines))
-	bodyHeight := height - headerLines
-	if bodyHeight <= 0 {
-		return fitHeight(content, height)
-	}
-
-	body := lines[headerLines:]
-	if len(body) <= bodyHeight {
-		return fitHeight(content, height)
-	}
-
-	bodyCursor := clamp(cursor, 0, len(body)-1)
-	start := clamp(bodyCursor-bodyHeight/2, 0, max(0, len(body)-bodyHeight))
-	out := append([]string{}, lines[:headerLines]...)
-	out = append(out, body[start:min(len(body), start+bodyHeight)]...)
-	for len(out) < height {
-		out = append(out, "")
-	}
-	return strings.Join(out, "\n")
+	return fitListAroundCursor(content, height, cursor)
 }
 
 func eventRowStyle(row TraceEventRowVM) lipgloss.Style {

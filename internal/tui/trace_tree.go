@@ -225,8 +225,14 @@ func flattenTraceTree(vm TraceTreeVM, expanded map[string]bool) []TraceTreeRow {
 func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int, record taskRecord) {
 	trace := vm.Trace
 	snapshot := BuildRunSnapshot(record, vm.TrajectoryPath)
+	status := narrativeRunStatus(record, trace)
 	writeField(b, "Task", shortString(trace.Problem.UserTask, 100), width)
-	writeField(b, "Status", narrativeRunStatus(record, trace), width)
+	writeField(b, "Status", status, width)
+	if outcome, confidence, reason, ok := traceOutcomeSignal(status, record, snapshot); ok {
+		writeField(b, "Outcome", outcome, width)
+		writeField(b, "Confidence", confidence, width)
+		writeField(b, "Reason", reason, width)
+	}
 	writeField(b, "Validation", validationSummary(snapshot), width)
 	if snapshot.FinalReview.ChangedFiles > 0 {
 		writeField(b, "Diff", fmt.Sprintf("%d files changed", snapshot.FinalReview.ChangedFiles), width)
@@ -262,6 +268,16 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 	// Span-level data remains available to move into a dedicated tab later.
 }
 
+func traceOutcomeSignal(status string, record taskRecord, snapshot RunSnapshot) (string, string, string, bool) {
+	if !strings.EqualFold(strings.TrimSpace(status), "submitted") {
+		return "", "", "", false
+	}
+	if snapshot.FinalReview.ChangedFiles > 0 || strings.TrimSpace(record.Result.Diff) != "" || snapshot.FinalReview.TestsRun > 0 {
+		return "", "", "", false
+	}
+	return "submitted, but no diff or validation recorded", "low", "no diff and no validation recorded", true
+}
+
 func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width int) string {
 	return renderTraceTreeASCIIOptions(rows, state, width, true)
 }
@@ -275,9 +291,9 @@ func renderTraceTreeASCIIOptions(rows []TraceTreeRow, state traceWorkspaceState,
 	b.WriteString(title)
 	b.WriteByte('\n')
 	if inlineSummary {
-		b.WriteString("j/k move  enter expand/collapse  o inspect  tab switch tab\n\n")
+		b.WriteString("j/k move  space fold  enter/o detail  O output  tab switch tab\n\n")
 	} else {
-		b.WriteString("j/k move  enter expand/collapse  h/l focus  o output\n\n")
+		b.WriteString("j/k move  space fold  h/l focus  enter/o detail  O output\n\n")
 	}
 
 	if len(rows) == 0 {
@@ -349,33 +365,16 @@ func renderTraceSplit(vm TraceWorkspaceVM, state traceWorkspaceState, width int,
 
 	left = fitTraceTreeAroundCursor(left, panelHeight, traceCursorForRows(state, vm.Rows))
 	right = fitHeightOffset(right, panelHeight, state.DetailOffset)
-	divider := mutedStyle.Width(1).Render("|")
 
-	return lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		lipgloss.NewStyle().Width(leftWidth).Render(left),
-		" ",
-		divider,
-		" ",
-		lipgloss.NewStyle().Width(rightWidth).Render(right),
-	)
+	return renderSplitPanels(left, right, leftWidth, rightWidth)
 }
 
 func traceSplitWidths(width int, gap int) (int, int) {
-	leftWidth := max(48, width*58/100)
-	rightWidth := max(36, width-leftWidth-gap)
-	if leftWidth+gap+rightWidth > width {
-		leftWidth = max(36, width-gap-rightWidth)
-	}
-	return leftWidth, rightWidth
+	return splitPanelWidths(width, gap, 58, 48, 36)
 }
 
 func traceSplitPanelHeight(left string, right string, height int) int {
-	panelHeight := max(lipgloss.Height(left), lipgloss.Height(right))
-	if height > 0 {
-		panelHeight = min(panelHeight, max(8, height-8))
-	}
-	return panelHeight
+	return splitPanelHeight(left, right, height, 8)
 }
 
 func traceDetailMaxOffset(vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int) int {
@@ -412,33 +411,7 @@ func fitHeightOffset(content string, height int, offset int) string {
 }
 
 func fitTraceTreeAroundCursor(content string, height int, cursor int) string {
-	if height <= 0 {
-		return ""
-	}
-	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
-	if len(lines) <= height {
-		return fitHeight(content, height)
-	}
-
-	headerLines := min(3, len(lines))
-	bodyHeight := height - headerLines
-	if bodyHeight <= 0 {
-		return fitHeight(content, height)
-	}
-
-	body := lines[headerLines:]
-	if len(body) <= bodyHeight {
-		return fitHeight(content, height)
-	}
-
-	bodyCursor := clamp(cursor, 0, len(body)-1)
-	start := clamp(bodyCursor-bodyHeight/2, 0, max(0, len(body)-bodyHeight))
-	out := append([]string{}, lines[:headerLines]...)
-	out = append(out, body[start:min(len(body), start+bodyHeight)]...)
-	for len(out) < height {
-		out = append(out, "")
-	}
-	return strings.Join(out, "\n")
+	return fitListAroundCursor(content, height, cursor)
 }
 
 func renderTraceTreePanel(vm TraceWorkspaceVM, state traceWorkspaceState, width int) string {
@@ -567,8 +540,42 @@ func renderTraceDetailOverview(b *strings.Builder, row TraceTreeRow, node TraceT
 			writeField(b, "Why", node.Summary, width)
 		}
 	}
-	if len(row.EventIDs) > 0 {
-		writeField(b, "Events", formatEventIDs(row.EventIDs), width)
+	renderTraceNodeRelated(b, row, node, width)
+}
+
+func renderTraceNodeRelated(b *strings.Builder, row TraceTreeRow, node TraceTreeNodeVM, width int) {
+	fields := []struct {
+		key   string
+		value any
+	}{}
+	add := func(key string, value any) {
+		if strings.TrimSpace(fmt.Sprint(value)) == "" {
+			return
+		}
+		fields = append(fields, struct {
+			key   string
+			value any
+		}{key, value})
+	}
+	add("Direction", node.DirectionID)
+	add("Prompt", node.PromptID)
+	eventIDs := node.EventIDs
+	if len(eventIDs) == 0 {
+		eventIDs = row.EventIDs
+	}
+	if len(eventIDs) > 0 {
+		add("Events", formatEventIDs(eventIDs))
+	}
+	if len(node.Children) > 0 {
+		add("Children", len(node.Children))
+	}
+
+	if len(fields) == 0 {
+		return
+	}
+	writeSection(b, "Related")
+	for _, field := range fields {
+		writeField(b, field.key, field.value, width)
 	}
 }
 

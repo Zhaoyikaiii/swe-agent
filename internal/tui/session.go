@@ -536,7 +536,7 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		case "1", "2", "3", "4", "5", "6":
 			m.setTraceTab(keyString)
 			return nil
-		case "d":
+		case "D", "ctrl+d":
 			m.toggleTraceDebug()
 			return nil
 		}
@@ -630,13 +630,14 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 					m.moveTraceCursor(-1)
 				}
 				return nil
-			case "enter":
-				if m.traceView.Pane == tracePaneTree {
-					m.toggleTraceNode()
-				}
+			case " ", "space":
+				m.toggleTraceNode()
 				return nil
-			case "o":
+			case "enter", "o":
 				m.openTraceNode()
+				return nil
+			case "O":
+				m.openTraceNodeOutput()
 				return nil
 			}
 		}
@@ -1879,6 +1880,15 @@ func (m *model) toggleTraceNode() {
 }
 
 func (m *model) openTraceNode() {
+	m.openTraceNodeDetail(nil)
+}
+
+func (m *model) openTraceNodeOutput() {
+	tab := traceDetailOutput
+	m.openTraceNodeDetail(&tab)
+}
+
+func (m *model) openTraceNodeDetail(tab *traceDetailTab) {
 	if m.traceView.Tab != traceTabTrace {
 		return
 	}
@@ -1895,7 +1905,9 @@ func (m *model) openTraceNode() {
 	row := vm.Rows[m.traceView.Cursor]
 	m.traceView.SelectedID = row.NodeID
 	m.traceView.Pane = tracePaneDetail
-	m.traceView.DetailTab = traceDetailOutput
+	if tab != nil {
+		m.traceView.DetailTab = *tab
+	}
 	m.traceView.DetailOffset = 0
 	m.status = "trace detail: " + traceDetailTabLabel(m.traceView.DetailTab)
 	m.updateDetail()
@@ -2686,7 +2698,7 @@ func overlayRows(base, popup string, width, height int) string {
 
 func (m *model) shortHelp() []key.Binding {
 	if m.view == viewTrace && m.mode == modeNormal {
-		return []key.Binding{keyTraceMove, keyTracePane, keyTraceFold, keyTraceInspect, keyTraceDetailTabs, keyTraceDebug, keyTraceTabs, keyEsc}
+		return m.traceShortHelp()
 	}
 
 	switch m.mode {
@@ -2698,6 +2710,18 @@ func (m *model) shortHelp() []key.Binding {
 		return []key.Binding{keyEnter, keyEsc}
 	default:
 		return []key.Binding{keyMove, keyOpen, keyTaskInput, keyHistory, keyCommand, keySearch, keyHelp, keyQuit}
+	}
+}
+
+func (m *model) traceShortHelp() []key.Binding {
+	common := []key.Binding{keyTracePane, keyTraceDetailTabs, keyTraceDebugDiff, keyTraceTabs, keyEsc}
+	switch {
+	case m.traceView.Tab == traceTabEvents:
+		return append([]key.Binding{keyTraceEventMove, keyTraceOpenDetail}, common...)
+	case isTraceCollectionTab(m.traceView.Tab):
+		return append([]key.Binding{keyTraceItemMove, keyTraceOpenDetail}, common...)
+	default:
+		return append([]key.Binding{keyTraceNodeMove, keyTraceOpenDetail, keyTraceFold, keyTraceOutput}, common...)
 	}
 }
 
@@ -3906,12 +3930,15 @@ var (
 	keyHistory         = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
 	keyTrace           = key.NewBinding(key.WithKeys("x", ":trace"), key.WithHelp("x", "trace workspace"))
 	keyOpenTrace       = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
-	keyTraceMove       = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "node"))
+	keyTraceNodeMove   = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "node"))
+	keyTraceEventMove  = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "event"))
+	keyTraceItemMove   = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "item"))
 	keyTracePane       = key.NewBinding(key.WithKeys("h/l"), key.WithHelp("h/l", "pane"))
-	keyTraceFold       = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "fold"))
-	keyTraceInspect    = key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "inspect"))
+	keyTraceFold       = key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "fold"))
+	keyTraceOutput     = key.NewBinding(key.WithKeys("O"), key.WithHelp("O", "output"))
+	keyTraceOpenDetail = key.NewBinding(key.WithKeys("enter", "o"), key.WithHelp("enter/o", "detail"))
 	keyTraceDetailTabs = key.NewBinding(key.WithKeys("[/]"), key.WithHelp("[/]", "detail"))
-	keyTraceDebug      = key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "debug"))
+	keyTraceDebugDiff  = key.NewBinding(key.WithKeys("D", "ctrl+d", "d"), key.WithHelp("D/d", "debug/diff"))
 	keyTraceTabs       = key.NewBinding(key.WithKeys("tab", "1-6"), key.WithHelp("tab/1-6", "trace tabs"))
 	keySlashHelp       = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
 	keySlashHistory    = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))

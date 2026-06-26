@@ -343,8 +343,8 @@ func TestTraceWorkspaceCompactTabsHideDebugDump(t *testing.T) {
 	}
 
 	memory := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabMemory}, 100, record.Result.TrajectoryPath)
-	if !strings.Contains(memory, "No memory used in this run.") || strings.Contains(memory, "Policy") {
-		t.Fatalf("expected compact memory tab to show one-line empty state, got:\n%s", memory)
+	if !strings.Contains(memory, "No memory surfaced for this run.") || strings.Contains(memory, "Policy") {
+		t.Fatalf("expected compact memory tab to show lightweight empty state, got:\n%s", memory)
 	}
 	memoryDebug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabMemory, Debug: true}, 100, record.Result.TrajectoryPath)
 	if !strings.Contains(memoryDebug, "Policy") {
@@ -943,8 +943,44 @@ func TestWideTraceUsesFullWidthWorkspace(t *testing.T) {
 	if footer := model.footerView(); !strings.Contains(footer, "trace tabs") {
 		t.Fatalf("expected trace-specific footer help, got:\n%s", footer)
 	}
-	if footer := model.footerView(); !strings.Contains(footer, "inspect") {
-		t.Fatalf("expected trace footer inspect help, got:\n%s", footer)
+	if footer := model.footerView(); !strings.Contains(footer, "node") || !strings.Contains(footer, "output") {
+		t.Fatalf("expected trace footer node/output help, got:\n%s", footer)
+	}
+}
+
+func TestTraceFooterHelpMatchesCurrentTab(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 140
+	model.height = 20
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+
+	traceFooter := model.footerView()
+	if !strings.Contains(traceFooter, "node") || !strings.Contains(traceFooter, "output") || !strings.Contains(traceFooter, "D/d") {
+		t.Fatalf("expected trace footer to describe node/output/debug-diff controls, got:\n%s", traceFooter)
+	}
+	if strings.Contains(traceFooter, "event") || strings.Contains(traceFooter, "item") {
+		t.Fatalf("expected trace footer not to expose event/item controls, got:\n%s", traceFooter)
+	}
+
+	model.setTraceTab("4")
+	eventsFooter := model.footerView()
+	if !strings.Contains(eventsFooter, "event") || !strings.Contains(eventsFooter, "enter/o") || !strings.Contains(eventsFooter, "detail") {
+		t.Fatalf("expected events footer to describe event/detail controls, got:\n%s", eventsFooter)
+	}
+	if strings.Contains(eventsFooter, "output") || strings.Contains(eventsFooter, "node") {
+		t.Fatalf("expected events footer not to expose trace node/output controls, got:\n%s", eventsFooter)
+	}
+
+	model.setTraceTab("2")
+	nextFooter := model.footerView()
+	if !strings.Contains(nextFooter, "item") || !strings.Contains(nextFooter, "enter/o") || !strings.Contains(nextFooter, "detail") {
+		t.Fatalf("expected collection footer to describe item/detail controls, got:\n%s", nextFooter)
+	}
+	if strings.Contains(nextFooter, "output") || strings.Contains(nextFooter, "event") {
+		t.Fatalf("expected collection footer not to expose trace output/event controls, got:\n%s", nextFooter)
 	}
 }
 
@@ -987,12 +1023,18 @@ func TestTraceWorkspaceJKMovesEventCursor(t *testing.T) {
 }
 
 func TestTraceWorkspaceEventsWideSplitAndDetailTabs(t *testing.T) {
+	traceContext := problemtrace.TraceContext{
+		TraceID:          "trace-1",
+		SpanID:           "span-action",
+		DirectionID:      "dir-tests",
+		PromptSnapshotID: "prompt-1",
+	}
 	record := taskRecord{
 		Task: core.Task{Text: "fix failing tests", Repo: "/repo"},
 		Events: []core.Event{
 			{Type: "user_task", Data: map[string]any{"task": "fix failing tests", "repo": "/repo"}},
 			{Type: "model_response", Data: map[string]any{"content": "I will run the focused tests."}},
-			{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "go test ./internal/tui"}}},
+			{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "go test ./internal/tui"}, "trace_context": traceContext}},
 			{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 1, "output_preview": "FAIL TestTraceWorkspaceEvents"}},
 		},
 	}
@@ -1002,14 +1044,20 @@ func TestTraceWorkspaceEventsWideSplitAndDetailTabs(t *testing.T) {
 		EventPane:   tracePaneDetail,
 	}
 
-	rendered := traceWorkspaceView(record, state, 140, 18, "trace.jsonl")
+	rendered := traceWorkspaceView(record, state, 140, 30, "trace.jsonl")
 
 	for _, want := range []string{
 		"Event Stream",
+		"Step 1",
 		"Selected Event [active]",
 		"[Overview]  Data  Trace  Raw",
+		"Step: 1",
 		"Action",
 		"Command: go test ./internal/tui",
+		"Related",
+		"Trace ID: trace-1",
+		"Direction: dir-tests",
+		"Prompt: prompt-1",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected events split to contain %q, got:\n%s", want, rendered)
@@ -1117,9 +1165,43 @@ func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
 	}
 }
 
+func TestTraceWorkspaceMemoryPromptEmptyStatesAreLightweight(t *testing.T) {
+	record := taskRecord{
+		Task: core.Task{Text: "fix it", Repo: "/repo"},
+	}
+
+	memory := traceWorkspaceView(record, traceWorkspaceState{Tab: traceTabMemory}, 140, 18, "")
+	for _, want := range []string{
+		"Memory Sources",
+		"No memory surfaced for this run.",
+		"Press D for debug policy context.",
+	} {
+		if !strings.Contains(memory, want) {
+			t.Fatalf("expected lightweight memory empty state to contain %q, got:\n%s", want, memory)
+		}
+	}
+
+	prompt := traceWorkspaceView(record, traceWorkspaceState{Tab: traceTabPrompt}, 140, 18, "")
+	for _, want := range []string{
+		"Prompt Context",
+		"No prompt snapshot surfaced for this run.",
+		"Press D for raw",
+		"prompt/debug",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected lightweight prompt empty state to contain %q, got:\n%s", want, prompt)
+		}
+	}
+
+	promptDebug := traceWorkspaceView(record, traceWorkspaceState{Tab: traceTabPrompt, Debug: true}, 140, 18, "")
+	if !strings.Contains(promptDebug, "No prompt snapshots recorded.") {
+		t.Fatalf("expected debug prompt empty state to keep raw wording, got:\n%s", promptDebug)
+	}
+}
+
 func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
-	model.width = 120
+	model.width = 180
 	model.height = 20
 	taskIndex := model.createTaskRecord(core.Task{Text: "fix go test import cycle", Repo: "/repo"}, "running", time.Now())
 	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
@@ -1144,8 +1226,8 @@ func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
 	}
 
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
-	if model.traceView.DetailOffset != 0 {
-		t.Fatalf("expected short detail pane to keep clamped offset=0, got %d", model.traceView.DetailOffset)
+	if model.traceView.DetailOffset != 1 {
+		t.Fatalf("expected j in detail pane to scroll detail offset to 1, got %d", model.traceView.DetailOffset)
 	}
 
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
@@ -1155,6 +1237,43 @@ func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 	if model.traceView.Cursor != 1 {
 		t.Fatalf("expected j in tree pane to move cursor, got %d", model.traceView.Cursor)
+	}
+}
+
+func TestTraceWorkspaceOpenKeysUseConsistentDetailSemantics(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 20
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix go test import cycle", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeySpace})
+	if model.traceView.Expanded["node-root"] {
+		t.Fatalf("expected space to collapse selected tree node")
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeySpace})
+	if !model.traceView.Expanded["node-root"] {
+		t.Fatalf("expected second space to expand selected tree node")
+	}
+
+	model.traceView.DetailTab = traceDetailOverview
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if model.traceView.Pane != tracePaneDetail || model.traceView.DetailTab != traceDetailOverview {
+		t.Fatalf("expected enter to focus detail without forcing output, pane=%v tab=%v", model.traceView.Pane, model.traceView.DetailTab)
+	}
+
+	model.setTracePane(tracePaneTree)
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if model.traceView.Pane != tracePaneDetail || model.traceView.DetailTab != traceDetailOverview {
+		t.Fatalf("expected o to focus detail without forcing output, pane=%v tab=%v", model.traceView.Pane, model.traceView.DetailTab)
+	}
+
+	model.setTracePane(tracePaneTree)
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("O")})
+	if model.traceView.Pane != tracePaneDetail || model.traceView.DetailTab != traceDetailOutput {
+		t.Fatalf("expected O to open output detail, pane=%v tab=%v", model.traceView.Pane, model.traceView.DetailTab)
 	}
 }
 
@@ -1204,7 +1323,7 @@ func TestTraceWorkspaceDTogglesDebug(t *testing.T) {
 	model.openTraceWorkspace()
 	model.detail.LineDown(3)
 
-	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
 
 	if !model.traceView.Debug {
 		t.Fatalf("expected trace debug mode to be enabled")
@@ -1216,12 +1335,35 @@ func TestTraceWorkspaceDTogglesDebug(t *testing.T) {
 		t.Fatalf("expected debug detail to reveal trace metadata, got:\n%s", detail)
 	}
 
-	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
 	if model.traceView.Debug {
 		t.Fatalf("expected trace debug mode to be disabled")
 	}
 	if detail := model.detailContent(); strings.Contains(detail, "Trace ID: trace-import-cycle") {
 		t.Fatalf("expected compact detail to hide trace metadata, got:\n%s", detail)
+	}
+}
+
+func TestTraceDDoesNotHideDiffAccess(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 180
+	model.height = 12
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+	if model.view != viewTrace || !model.traceView.Debug {
+		t.Fatalf("expected D in trace workspace to toggle debug without leaving trace, view=%v debug=%v", model.view, model.traceView.Debug)
+	}
+	if footer := model.footerView(); !strings.Contains(footer, "D/d") || !strings.Contains(footer, "debug/diff") {
+		t.Fatalf("expected trace footer to expose debug and diff access, got:\n%s", footer)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if model.view != viewDiff {
+		t.Fatalf("expected d to open diff from trace workspace, got view=%v", model.view)
 	}
 }
 

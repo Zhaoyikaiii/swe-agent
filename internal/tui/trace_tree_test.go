@@ -194,6 +194,31 @@ func TestTraceNarrativeHidesPromptSnapshotsUnlessDebug(t *testing.T) {
 	}
 }
 
+func TestTraceWorkspaceSubmittedWithoutEvidenceShowsLowConfidenceOutcome(t *testing.T) {
+	record := taskRecord{
+		Task:   core.Task{Text: "fix it", Repo: "/repo"},
+		Status: "submitted",
+		Events: []core.Event{
+			{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}},
+			{Type: "final", Data: map[string]any{"status": "submitted", "steps": 1, "submission": "submitted"}},
+		},
+		Result: agentpkg.Result{Status: "submitted"},
+	}
+
+	rendered := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabTrace}, 100, "")
+
+	for _, want := range []string{
+		"Status: submitted",
+		"Outcome: submitted, but no diff or validation recorded",
+		"Confidence: low",
+		"Reason: no diff and no validation recorded",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected low-confidence submitted trace to contain %q, got:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestTraceNarrativeCompactsRepeatedEvidence(t *testing.T) {
 	trace := problemtrace.ProblemTrace{
 		Problem: problemtrace.ProblemContext{UserTask: "inspect repo"},
