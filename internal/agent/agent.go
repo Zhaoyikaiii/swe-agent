@@ -21,6 +21,7 @@ type ActionParser interface {
 type Workspace interface {
 	Root() string
 	Diff(ctx context.Context) (string, error)
+	Status(ctx context.Context) (string, error)
 }
 
 type Result struct {
@@ -33,14 +34,16 @@ type Result struct {
 }
 
 type State struct {
-	Task       core.Task
-	Messages   []core.Message
-	Steps      int
-	Usage      core.Usage
-	Submitted  bool
-	Submission string
-	Status     string
-	startedAt  time.Time
+	Task         core.Task
+	Messages     []core.Message
+	Steps        int
+	Usage        core.Usage
+	Submitted    bool
+	Submission   string
+	Status       string
+	Requirements taskRequirements
+	Evidence     submitEvidence
+	startedAt    time.Time
 }
 
 type Agent struct {
@@ -69,9 +72,10 @@ func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
 	}
 
 	state := &State{
-		Task:      task,
-		Status:    "running",
-		startedAt: time.Now(),
+		Task:         task,
+		Status:       "running",
+		Requirements: detectTaskRequirements(task.Text),
+		startedAt:    time.Now(),
 		Messages: []core.Message{
 			{Role: core.RoleSystem, Content: a.Config.Agent.SystemPrompt},
 			{Role: core.RoleUser, Content: a.initialUserMessage(task)},
@@ -80,6 +84,13 @@ func (a *Agent) Run(ctx context.Context, task core.Task) (Result, error) {
 	a.appendEvent(ctx, core.Event{Type: "user_task", Data: map[string]any{"task": task.Text, "repo": task.Repo}})
 	if a.Trace != nil {
 		a.appendEvents(ctx, a.Trace.StartRun(ctx, task, a.traceResource(task)))
+	}
+	if state.Requirements.PRURL != "" {
+		if blocked := a.runPRPreflight(ctx, state); blocked != "" {
+			state.Status = "blocked"
+			state.Submission = blocked
+			a.appendEvent(ctx, core.Event{Type: "blocked", Data: map[string]any{"reason": blocked}})
+		}
 	}
 
 	var runErr error
@@ -181,6 +192,12 @@ func (a *Agent) Step(ctx context.Context, state *State) error {
 	state.Usage.CostUSD += resp.Usage.CostUSD
 	state.Messages = append(state.Messages, resp.Message)
 	responseData := map[string]any{"step": state.Steps, "content": resp.Message.Content, "usage": resp.Usage}
+	if resp.FinishReason != "" {
+		responseData["finish_reason"] = resp.FinishReason
+	}
+	if len(resp.Message.Extra) > 0 {
+		responseData["message_extra"] = resp.Message.Extra
+	}
 	if modelContext.TraceID != "" {
 		responseData["trace_context"] = modelContext
 	}
@@ -212,6 +229,11 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		state.Messages = append(state.Messages, core.Message{Role: core.RoleTool, Name: call.Name, Content: msg})
 		return nil
 	}
+	a.appendEvent(ctx, core.Event{Type: "tool_proposed", Data: map[string]any{
+		"tool": call.Name,
+		"args": call.Args,
+		"risk": t.Risk(),
+	}})
 	decision, err := a.Policy.AllowTool(ctx, call, t.Spec(), t.Risk())
 	if err != nil {
 		return fmt.Errorf("policy check %s: %w", call.Name, err)
@@ -244,6 +266,22 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		return fmt.Errorf("execute tool %s: %w", call.Name, err)
 	}
 	result = a.Policy.FilterObservation(ctx, result)
+	a.recordToolEvidence(state, call, result)
+	submitAccepted := isSubmitAttempt(call, result)
+	if submitAccepted {
+		if rejection := a.submitRejection(ctx, state); rejection != "" {
+			result = core.ToolResult{
+				Output: rejection + "\nContinue working.\n",
+				Code:   1,
+			}
+			submitAccepted = false
+			a.appendEvent(ctx, core.Event{Type: "submit_rejected", Data: map[string]any{
+				"reason":       rejection,
+				"requirements": state.Requirements,
+				"evidence":     state.Evidence,
+			}})
+		}
+	}
 	resultData := buildToolResultEventData(call, result)
 	if toolContext.TraceID != "" {
 		resultData["trace_context"] = toolContext
@@ -253,7 +291,7 @@ func (a *Agent) executeCall(ctx context.Context, state *State, call core.ToolCal
 		a.appendEvents(ctx, a.Trace.ObserveToolResult(ctx, toolContext, call, result))
 	}
 
-	if call.Name == "submit" || isSubmitOutput(result.Output) {
+	if submitAccepted {
 		state.Submitted = true
 		state.Submission = extractSubmission(result.Output)
 	}
@@ -278,6 +316,9 @@ func (a *Agent) appendEvents(ctx context.Context, events []core.Event) {
 }
 
 func (a *Agent) shouldContinue(state *State) bool {
+	if state.Status != "running" {
+		return false
+	}
 	if state.Submitted {
 		return false
 	}
@@ -294,7 +335,11 @@ func (a *Agent) shouldContinue(state *State) bool {
 }
 
 func (a *Agent) initialUserMessage(task core.Task) string {
-	return fmt.Sprintf("Task:\n%s\n\nRepository root: %s\n\nWork step by step. Inspect relevant files before editing. Run focused verification before submitting.", task.Text, task.Repo)
+	msg := fmt.Sprintf("Task:\n%s\n\nRepository root: %s\n\nWork step by step. Inspect relevant files before editing. Run focused verification before submitting.", task.Text, task.Repo)
+	if conditions := submitConditionSummary(detectTaskRequirements(task.Text)); conditions != "" {
+		msg += "\n\nSubmit conditions:\n" + conditions
+	}
+	return msg
 }
 
 func (a *Agent) traceResource(task core.Task) problemtrace.TraceResource {
@@ -483,6 +528,10 @@ func formatToolObservation(result core.ToolResult) string {
 
 func isSubmitOutput(out string) bool {
 	return strings.Contains(out, "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")
+}
+
+func isSubmitAttempt(call core.ToolCall, result core.ToolResult) bool {
+	return call.Name == "submit" || isSubmitOutput(result.Output)
 }
 
 func extractSubmission(out string) string {
