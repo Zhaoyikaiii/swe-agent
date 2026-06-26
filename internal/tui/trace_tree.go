@@ -64,8 +64,16 @@ var (
 	traceEventStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	traceFixStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)
 	traceErrorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	tracePaneTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("24")).Bold(true)
 	traceSelectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("24")).Bold(true)
 )
+
+func renderTracePaneTitle(title string, active bool) string {
+	if active {
+		return tracePaneTitleStyle.Render(title)
+	}
+	return title
+}
 
 func (s *traceWorkspaceState) ensureDefaults() {
 	if s.Expanded == nil {
@@ -285,10 +293,7 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 func renderTraceTreeASCIIOptions(rows []TraceTreeRow, state traceWorkspaceState, width int, inlineSummary bool) string {
 	var b strings.Builder
 	title := "Trace Tree"
-	if !inlineSummary && state.Pane == tracePaneTree {
-		title += " [active]"
-	}
-	b.WriteString(title)
+	b.WriteString(renderTracePaneTitle(title, !inlineSummary && state.Pane == tracePaneTree))
 	b.WriteByte('\n')
 	if inlineSummary {
 		b.WriteString("j/k move  space fold  enter/o detail  O output  tab switch tab\n\n")
@@ -421,10 +426,7 @@ func renderTraceTreePanel(vm TraceWorkspaceVM, state traceWorkspaceState, width 
 func renderTraceDetailPanel(vm TraceWorkspaceVM, state traceWorkspaceState, width int) string {
 	var b strings.Builder
 	title := "Selected Detail"
-	if state.Pane == tracePaneDetail {
-		title += " [active]"
-	}
-	b.WriteString(title)
+	b.WriteString(renderTracePaneTitle(title, state.Pane == tracePaneDetail))
 	b.WriteByte('\n')
 
 	row, node, ok := selectedTraceNode(vm, state)

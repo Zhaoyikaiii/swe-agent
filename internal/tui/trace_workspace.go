@@ -483,10 +483,7 @@ func renderTraceCollectionListOnly(b *strings.Builder, collection TraceCollectio
 func renderTraceCollectionList(collection TraceCollectionVM, cursor int, width int, active bool) string {
 	var b strings.Builder
 	title := collection.Title
-	if active {
-		title += " [active]"
-	}
-	b.WriteString(title)
+	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
 	b.WriteString("j/k move  h/l focus  enter/o detail  [/] detail  D debug\n\n")
 
@@ -531,10 +528,7 @@ func renderTraceCollectionList(collection TraceCollectionVM, cursor int, width i
 func renderTraceCollectionDetail(collection TraceCollectionVM, row TraceCollectionRowVM, tab traceCollectionTab, width int, active bool) string {
 	var b strings.Builder
 	title := collection.DetailTitle
-	if active {
-		title += " [active]"
-	}
-	b.WriteString(title)
+	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
 	b.WriteString(traceCollectionTabs(tab))
 	b.WriteString("\n\n")
@@ -1029,10 +1023,7 @@ func renderTraceEventListOnly(b *strings.Builder, rows []TraceEventRowVM, cursor
 func renderTraceEventList(rows []TraceEventRowVM, cursor int, width int, active bool) string {
 	var b strings.Builder
 	title := "Event Stream"
-	if active {
-		title += " [active]"
-	}
-	b.WriteString(title)
+	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
 	b.WriteString("j/k move  h/l focus  enter/o detail  [/] detail  D debug\n\n")
 
@@ -1111,10 +1102,7 @@ func traceEventDisplayCursor(rows []TraceEventRowVM, cursor int) int {
 func renderTraceEventDetail(row TraceEventRowVM, tab traceEventTab, width int, active bool) string {
 	var b strings.Builder
 	title := "Selected Event"
-	if active {
-		title += " [active]"
-	}
-	b.WriteString(title)
+	b.WriteString(renderTracePaneTitle(title, active))
 	b.WriteByte('\n')
 	b.WriteString(traceEventTabs(tab))
 	b.WriteString("\n\n")

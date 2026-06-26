@@ -139,13 +139,16 @@ func TestPreviewCommandRenderLoadsTrace(t *testing.T) {
 	})
 	for _, want := range []string{
 		"Problem Trace Workspace",
-		"Trace Tree [active]",
+		"Trace Tree",
 		"Selected Detail",
 		"Fix unresolved PR review comments",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected preview render to contain %q, got:\n%s", want, output)
 		}
+	}
+	if strings.Contains(output, "[active]") {
+		t.Fatalf("expected active pane focus to be styled, not rendered as text:\n%s", output)
 	}
 }
 

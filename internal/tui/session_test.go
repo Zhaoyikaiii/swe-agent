@@ -566,7 +566,7 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Validation: not recorded",
 		"Active: Resolve the Go import cycle",
 		"Symptom: Go compile failed with import cycle not allowed: go test ./...",
-		"Trace Tree [active]",
+		"Trace Tree",
 		"Selected Detail",
 		"[Overview]  Output  Events  Debug",
 		"> [-] * Task  task  running",
@@ -592,10 +592,24 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Selected Node",
 		"ID: node-root",
 		"Span Graph",
+		"[active]",
 	} {
 		if strings.Contains(rendered, unwanted) {
 			t.Fatalf("expected compact trace view to hide %q, got:\n%s", unwanted, rendered)
 		}
+	}
+}
+
+func TestTracePaneTitleHighlightsWithoutActiveText(t *testing.T) {
+	rendered := renderTracePaneTitle("Selected Event", true)
+	if !strings.Contains(rendered, "Selected Event") {
+		t.Fatalf("expected active title to keep readable text, got %q", rendered)
+	}
+	if strings.Contains(rendered, "[active]") {
+		t.Fatalf("expected active title to use styling instead of [active] text, got %q", rendered)
+	}
+	if got := renderTracePaneTitle("Selected Event", false); got != "Selected Event" {
+		t.Fatalf("expected inactive title to render as plain text, got %q", got)
 	}
 }
 
@@ -1204,7 +1218,7 @@ func TestTraceWorkspaceEventsWideSplitAndDetailTabs(t *testing.T) {
 	for _, want := range []string{
 		"Event Stream",
 		"Step 1",
-		"Selected Event [active]",
+		"Selected Event",
 		"[Overview]  Data  Trace  Raw",
 		"Step: 1",
 		"Action",
@@ -1217,6 +1231,9 @@ func TestTraceWorkspaceEventsWideSplitAndDetailTabs(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected events split to contain %q, got:\n%s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "[active]") {
+		t.Fatalf("expected active event pane focus to be styled, not rendered as text:\n%s", rendered)
 	}
 }
 
@@ -1276,7 +1293,7 @@ func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
 				Tab:            traceTabFrontier,
 				CollectionPane: tracePaneDetail,
 			},
-			want: []string{"Next Work", "Selected Next [active]", "[Overview]  Data  Raw", "Resolve the Go import cycle"},
+			want: []string{"Next Work", "Selected Next", "[Overview]  Data  Raw", "Resolve the Go import cycle"},
 		},
 		{
 			name:   "memory",
@@ -1286,7 +1303,7 @@ func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
 				Debug:          true,
 				CollectionPane: tracePaneDetail,
 			},
-			want: []string{"Memory Sources", "Selected Memory [active]", "[Overview]  Data  Raw", "Policy"},
+			want: []string{"Memory Sources", "Selected Memory", "[Overview]  Data  Raw", "Policy"},
 		},
 		{
 			name:   "prompt",
@@ -1295,7 +1312,7 @@ func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
 				Tab:            traceTabPrompt,
 				CollectionPane: tracePaneDetail,
 			},
-			want: []string{"Prompt Context", "Selected Prompt [active]", "[Overview]  Data  Raw", "Latest Prompt"},
+			want: []string{"Prompt Context", "Selected Prompt", "[Overview]  Data  Raw", "Latest Prompt"},
 		},
 		{
 			name:   "learn",
@@ -1304,7 +1321,7 @@ func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
 				Tab:            traceTabCards,
 				CollectionPane: tracePaneDetail,
 			},
-			want: []string{"Draft Memory Cards", "Selected Card [active]", "[Overview]  Data  Raw", "run_summary"},
+			want: []string{"Draft Memory Cards", "Selected Card", "[Overview]  Data  Raw", "run_summary"},
 		},
 	}
 
@@ -1315,6 +1332,9 @@ func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
 				if !strings.Contains(rendered, want) {
 					t.Fatalf("expected %s collection split to contain %q, got:\n%s", tc.name, want, rendered)
 				}
+			}
+			if strings.Contains(rendered, "[active]") {
+				t.Fatalf("expected active collection pane focus to be styled, not rendered as text:\n%s", rendered)
 			}
 		})
 	}
