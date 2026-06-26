@@ -47,6 +47,7 @@ func generateNarrative(parent context.Context, ag *agentpkg.Agent, snapshot RunS
 		Temperature: 0.2,
 		MaxTokens:   320,
 		WorkingDir:  snapshot.Task.Repo,
+		Mode:        core.ModelModeChat,
 	})
 	if err != nil {
 		return "", err

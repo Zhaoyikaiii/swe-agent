@@ -16,6 +16,27 @@ import (
 	"github.com/local/swe-agent/internal/problemtrace"
 )
 
+type captureModel struct {
+	response string
+	requests []core.ModelRequest
+}
+
+func (m *captureModel) Complete(ctx context.Context, req core.ModelRequest) (core.ModelResponse, error) {
+	m.requests = append(m.requests, req)
+	content := m.response
+	if content == "" {
+		content = "captured answer"
+	}
+	return core.ModelResponse{
+		Message: core.Message{Role: core.RoleAssistant, Content: content},
+		Usage: core.Usage{
+			InputTokens:  len(req.Messages) * 16,
+			OutputTokens: len(content) / 4,
+		},
+		FinishReason: "stop",
+	}, nil
+}
+
 func TestLoopSlashClearResetsVisibleSession(t *testing.T) {
 	session := NewSession()
 	model := newLoopModel(session, &agentpkg.Agent{}, "/repo", context.Background())
@@ -95,6 +116,114 @@ func TestStartRunFromLoopPreparesActiveTask(t *testing.T) {
 	}
 	if model.tasks[0].Task.Text != "fix failing test" {
 		t.Fatalf("expected task record to store trimmed task text, got %q", model.tasks[0].Task.Text)
+	}
+}
+
+func TestSlashChatOpensAskMode(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "submitted", time.Now())
+	model.setSelectedTask(taskIndex)
+
+	cmd := model.executeSlashCommand("/chat")
+
+	if cmd == nil {
+		t.Fatal("expected focus command")
+	}
+	if model.mode != modeChat {
+		t.Fatalf("expected chat mode, got %v", model.mode)
+	}
+	if got := model.command.Prompt; got != "ask> " {
+		t.Fatalf("expected ask prompt, got %q", got)
+	}
+
+	model.executeSlashCommand("/run")
+	if model.mode != modeNormal || model.view != viewOverview {
+		t.Fatalf("expected /run to return to overview, mode=%v view=%v", model.mode, model.view)
+	}
+}
+
+func TestAskModeAppendsQuestionAndUsesChatModelMode(t *testing.T) {
+	capture := &captureModel{response: "No validation event is recorded."}
+	model := newLoopModel(NewSession(), &agentpkg.Agent{Model: capture}, "/repo", context.Background())
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "submitted", time.Now())
+	model.tasks[taskIndex].Events = []core.Event{
+		{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}},
+		{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "apply_patch"}}},
+		{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 0, "output": "patched"}},
+		{Type: "final", Data: map[string]any{"status": "submitted", "steps": 1, "submission": "patched"}},
+	}
+	model.tasks[taskIndex].Result = agentpkg.Result{Status: "submitted", Submission: "patched"}
+	model.setSelectedTask(taskIndex)
+	model.openChatMode()
+	model.command.SetValue("why no tests?")
+
+	cmd := model.handleChatKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected chat command")
+	}
+	if got := len(model.tasks[taskIndex].Chat); got != 1 {
+		t.Fatalf("expected user question to be appended, got %d entries", got)
+	}
+	msg, ok := cmd().(chatReadyMsg)
+	if !ok {
+		t.Fatalf("expected chatReadyMsg, got %T", msg)
+	}
+	if msg.err != nil {
+		t.Fatalf("chat command failed: %v", msg.err)
+	}
+	if len(capture.requests) != 1 {
+		t.Fatalf("expected one model request, got %d", len(capture.requests))
+	}
+	req := capture.requests[0]
+	if req.Mode != core.ModelModeChat {
+		t.Fatalf("expected chat model mode, got %q", req.Mode)
+	}
+	if !strings.Contains(req.Messages[1].Content, "Known Gaps") || !strings.Contains(req.Messages[1].Content, "Question:\nwhy no tests?") {
+		t.Fatalf("expected projected context and question, got:\n%s", req.Messages[1].Content)
+	}
+
+	model.Update(msg)
+	chat := model.tasks[taskIndex].Chat
+	if len(chat) != 2 || chat[1].Title != "Assistant" || !strings.Contains(chat[1].Body, "No validation") {
+		t.Fatalf("expected assistant answer in chat, got %#v", chat)
+	}
+}
+
+func TestContinueModeStartsFollowupRunWithPreviousContext(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix it", Repo: "/repo"}, "submitted", time.Now())
+	model.tasks[taskIndex].Events = []core.Event{
+		{Type: "user_task", Data: map[string]any{"task": "fix it", "repo": "/repo"}},
+		{Type: "tool_call", Data: map[string]any{"tool": "run_tests", "args": map[string]any{"command": "go test ./..."}}},
+		{Type: "tool_result", Data: map[string]any{"tool": "run_tests", "code": 1, "output": "failed"}},
+		{Type: "final", Data: map[string]any{"status": "submitted", "steps": 1, "submission": "tests still failing"}},
+	}
+	model.tasks[taskIndex].Result = agentpkg.Result{Status: "submitted", Submission: "tests still failing"}
+	model.setSelectedTask(taskIndex)
+	model.openContinueMode()
+	model.command.SetValue("fix the remaining failure")
+
+	cmd := model.handleContinueKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if model.cancel != nil {
+		defer model.cancel()
+	}
+
+	if cmd == nil {
+		t.Fatal("expected follow-up run command")
+	}
+	if !model.running {
+		t.Fatal("expected follow-up run to be active")
+	}
+	for _, want := range []string{
+		"Continue from the previous SWE-agent run.",
+		"Previous run context:",
+		"Task: fix it",
+		"Follow-up instruction:",
+		"fix the remaining failure",
+	} {
+		if !strings.Contains(model.task.Text, want) {
+			t.Fatalf("follow-up task missing %q:\n%s", want, model.task.Text)
+		}
 	}
 }
 
@@ -265,6 +394,32 @@ func TestRunDoneStartsAsyncNarrativeGeneration(t *testing.T) {
 	}
 	if !strings.Contains(model.detailContent(), "The generated review.") {
 		t.Fatalf("expected detail to render generated narrative, got:\n%s", model.detailContent())
+	}
+}
+
+func TestGenerateNarrativeUsesChatModelMode(t *testing.T) {
+	capture := &captureModel{response: "The run completed with no validation recorded."}
+	ag := &agentpkg.Agent{Model: capture}
+	snapshot := RunSnapshot{
+		Task: core.Task{Text: "fix it", Repo: "/repo"},
+		FinalReview: FinalReview{
+			Status: "submitted",
+		},
+	}
+
+	body, err := generateNarrative(context.Background(), ag, snapshot, nil)
+
+	if err != nil {
+		t.Fatalf("generateNarrative: %v", err)
+	}
+	if body != capture.response {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	if len(capture.requests) != 1 {
+		t.Fatalf("expected one model request, got %d", len(capture.requests))
+	}
+	if capture.requests[0].Mode != core.ModelModeChat {
+		t.Fatalf("expected narrative to use chat mode, got %q", capture.requests[0].Mode)
 	}
 }
 

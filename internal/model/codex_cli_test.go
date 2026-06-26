@@ -220,3 +220,35 @@ func TestBuildCodexPromptRequiresOneShellAction(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildCodexPromptChatModeDoesNotRequireShellAction(t *testing.T) {
+	prompt := buildCodexPrompt(core.ModelRequest{
+		Mode:       core.ModelModeChat,
+		WorkingDir: "/repo",
+		Messages: []core.Message{
+			{Role: core.RoleSystem, Content: "answer from facts"},
+			{Role: core.RoleUser, Content: "why no tests?"},
+		},
+	})
+
+	for _, want := range []string{
+		"answering directly in prose",
+		"Do not emit tool calls",
+		"Workspace: /repo",
+		"<user>",
+		"why no tests?",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("chat prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{
+		"Return exactly one fenced shell action block",
+		"```swe_shell",
+		"Before submit:",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("chat prompt should not contain %q:\n%s", unwanted, prompt)
+		}
+	}
+}

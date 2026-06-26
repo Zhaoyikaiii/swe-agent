@@ -135,6 +135,8 @@ const (
 	modeApproval
 	modeCommand
 	modeTask
+	modeChat
+	modeContinue
 	modeSearch
 	modeHelp
 	modeQuitConfirm
@@ -483,6 +485,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.updateDetail()
 		}
+	case chatReadyMsg:
+		record := m.findTaskByID(msg.taskID)
+		if record != nil {
+			body := strings.TrimSpace(msg.answer)
+			if msg.err != nil {
+				body = "Chat error: " + msg.err.Error()
+				m.status = "chat error: " + msg.err.Error()
+			} else {
+				m.status = "answered"
+			}
+			record.Chat = append(record.Chat, chatEntry{
+				Role:  "assistant",
+				Title: "Assistant",
+				Body:  body,
+				Time:  time.Now(),
+			})
+			if selected := m.selectedTaskRecord(); selected != nil && selected.ID == msg.taskID && m.sidebar == sidebarRun {
+				m.view = viewOverview
+				m.selected = len(record.Chat) - 1
+				m.ensureChatVisible()
+				m.saveSelectedTaskView()
+			}
+			m.updateDetail()
+		}
 	case editorDoneMsg:
 		if msg.err != nil {
 			m.status = "editor error: " + msg.err.Error()
@@ -505,6 +531,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.handleCommandKey(msg)
 	case modeTask:
 		return m.handleTaskKey(msg)
+	case modeChat:
+		return m.handleChatKey(msg)
+	case modeContinue:
+		return m.handleContinueKey(msg)
 	case modeSearch:
 		return m.handleSearchKey(msg)
 	case modeHelp:
@@ -527,6 +557,10 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 			m.status = "run overview"
 			m.updateDetail()
 			return nil
+		case "a":
+			return m.openChatMode()
+		case "c":
+			return m.openContinueMode()
 		case "tab":
 			m.cycleTraceTab(1)
 			return nil
@@ -670,6 +704,10 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		if m.loop && !m.running {
 			return m.openTaskMode()
 		}
+	case "a":
+		return m.openChatMode()
+	case "c":
+		return m.openContinueMode()
 	case "/":
 		return m.openSearchMode()
 	case "tab", "shift+tab":
@@ -810,6 +848,83 @@ func (m *model) handleTaskKey(msg tea.KeyMsg) tea.Cmd {
 	}
 }
 
+func (m *model) handleChatKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.closeInput()
+		return nil
+	case "enter":
+		question := strings.TrimSpace(m.command.Value())
+		m.command.Reset()
+		if question == "" {
+			m.status = "empty question"
+			return nil
+		}
+		record := m.selectedTaskRecord()
+		if record == nil {
+			m.status = "no run selected to chat about"
+			m.closeInput()
+			return nil
+		}
+		record.Chat = append(record.Chat, chatEntry{
+			Role:  "user",
+			Title: "You",
+			Body:  question,
+			Time:  time.Now(),
+		})
+		recordCopy := *record
+		if recordCopy.Result.TrajectoryPath == "" {
+			recordCopy.Result.TrajectoryPath = m.trajectoryPath()
+		}
+		taskID := record.ID
+		selectedTraceNodeID := m.selectedTraceNodeID()
+		m.sidebar = sidebarRun
+		m.view = viewOverview
+		m.selected = len(record.Chat) - 1
+		m.ensureChatVisible()
+		m.saveSelectedTaskView()
+		m.status = "asking model..."
+		m.updateDetail()
+		m.closeInput()
+		return runChatCmd(m.parent, m.agent, taskID, recordCopy, question, selectedTraceNodeID)
+	default:
+		var cmd tea.Cmd
+		m.command, cmd = m.command.Update(msg)
+		return cmd
+	}
+}
+
+func (m *model) handleContinueKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.closeInput()
+		return nil
+	case "enter":
+		instruction := strings.TrimSpace(m.command.Value())
+		m.command.Reset()
+		if instruction == "" {
+			m.status = "empty follow-up instruction"
+			return nil
+		}
+		record := m.selectedTaskRecord()
+		if record == nil {
+			m.status = "no run selected to continue"
+			m.closeInput()
+			return nil
+		}
+		recordCopy := *record
+		if recordCopy.Result.TrajectoryPath == "" {
+			recordCopy.Result.TrajectoryPath = m.trajectoryPath()
+		}
+		followup := buildFollowupTask(recordCopy, instruction, m.selectedTraceNodeID())
+		return m.startRun(followup)
+	default:
+		var cmd tea.Cmd
+		m.command, cmd = m.command.Update(msg)
+		return cmd
+	}
+}
+
 func (m *model) handleSearchKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc", "ctrl+c":
@@ -890,6 +1005,36 @@ func (m *model) openSearchMode() tea.Cmd {
 	return m.command.Focus()
 }
 
+func (m *model) openChatMode() tea.Cmd {
+	if m.selectedTaskRecord() == nil {
+		m.status = "no run selected to chat about"
+		return nil
+	}
+	m.mode = modeChat
+	m.command.Reset()
+	m.command.Prompt = "ask> "
+	m.command.Placeholder = "ask about this run, trace, diff, or next step"
+	m.command.Width = max(10, m.width-18)
+	return m.command.Focus()
+}
+
+func (m *model) openContinueMode() tea.Cmd {
+	if m.selectedTaskRecord() == nil {
+		m.status = "no run selected to continue"
+		return nil
+	}
+	if m.running {
+		m.status = "run is already active"
+		return nil
+	}
+	m.mode = modeContinue
+	m.command.Reset()
+	m.command.Prompt = "continue> "
+	m.command.Placeholder = "tell the agent what to do next from this run"
+	m.command.Width = max(10, m.width-18)
+	return m.command.Focus()
+}
+
 func (m *model) closeInput() {
 	m.command.Blur()
 	if m.approval != nil {
@@ -927,7 +1072,11 @@ func (m *model) executeCommand(command string) tea.Cmd {
 		m.view = viewSteps
 		m.focus = "detail"
 		m.updateDetail()
-	case "t", "timeline", "events", "chat", "run", "overview":
+	case "chat", "ask":
+		return m.openChatMode()
+	case "continue", "cont":
+		return m.openContinueMode()
+	case "t", "timeline", "events", "run", "overview":
 		m.showRun()
 	case "clear":
 		m.clearSession()
@@ -966,7 +1115,11 @@ func (m *model) executeSlashCommand(command string) tea.Cmd {
 		m.view = viewSteps
 		m.focus = "detail"
 		m.updateDetail()
-	case "t", "timeline", "events", "chat", "run", "overview":
+	case "chat", "ask":
+		return m.openChatMode()
+	case "continue", "cont":
+		return m.openContinueMode()
+	case "t", "timeline", "events", "run", "overview":
 		m.showRun()
 	case "history", "tasks":
 		m.showHistory()
@@ -992,7 +1145,7 @@ func (m *model) openTaskMode() tea.Cmd {
 func (m *model) prepareTaskInput(reset bool) {
 	m.mode = modeTask
 	m.command.Prompt = "task> "
-	m.command.Placeholder = "type a task or /history"
+	m.command.Placeholder = "type a task, /chat, /continue, or /history"
 	m.command.Width = max(10, m.width-18)
 	if reset {
 		m.command.Reset()
@@ -1998,6 +2151,13 @@ func (m *model) showRun() {
 	m.updateDetail()
 }
 
+func (m *model) selectedTraceNodeID() string {
+	if m.view != viewTrace || m.traceView.Tab != traceTabTrace {
+		return ""
+	}
+	return strings.TrimSpace(m.traceView.SelectedID)
+}
+
 func (m *model) scrollDetailHalfPage(direction int) {
 	if direction > 0 {
 		m.detail.HalfPageDown()
@@ -2141,7 +2301,7 @@ func (m *model) composerVisible() bool {
 	if m.approval != nil {
 		return false
 	}
-	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask {
+	if m.mode == modeCommand || m.mode == modeSearch || m.mode == modeTask || m.mode == modeChat || m.mode == modeContinue {
 		return true
 	}
 	return m.loop
@@ -2237,7 +2397,7 @@ func (m *model) detailContent() string {
 			return timelineViewWidth(*record, m.runSnapshot(*record), m.detail.Width)
 		}
 		if m.loop && !m.running {
-			return "Timeline\n\nYou\n  Type a task below to start.\n\nComposer\n  /history  /clear  /quit  /help  /diff  /trace  /open-trace"
+			return "Timeline\n\nYou\n  Type a task below to start.\n\nComposer\n  /chat  /continue  /history  /clear  /quit  /help  /diff  /trace  /open-trace"
 		}
 		return "Waiting for events..."
 	}
@@ -2481,6 +2641,10 @@ func (m *model) inputView() string {
 		prompt = "Search"
 	case modeTask:
 		prompt = "Task"
+	case modeChat:
+		prompt = "Ask"
+	case modeContinue:
+		prompt = "Continue"
 	default:
 		if m.running {
 			prompt = "Busy"
@@ -2656,10 +2820,10 @@ func (m *model) helpContent(width int) string {
 		wrapText("The bottom composer is the stable place for tasks and slash commands. During a run it stays visible as a status area while the timeline and inspector update above it.", width),
 		"",
 		"Composer",
-		wrapText("  i starts task input. Enter submits. Slash commands work from the composer, for example /history or /diff.", width),
+		wrapText("  i starts task input. a asks about the selected run. c continues from the selected run as a new follow-up task. Enter submits. Slash commands work from the composer, for example /history or /diff.", width),
 		"",
 		"Slash commands",
-		wrapText("  /help opens this guide. /history shows prior runs. /clear resets the visible session. /diff, /tests, /steps, /trace, and /open-trace switch inspector views. /quit exits or cancels.", width),
+		wrapText("  /help opens this guide. /chat and /ask ask about the selected run. /continue starts a follow-up run. /run returns to the overview. /history shows prior runs. /clear resets the visible session. /diff, /tests, /steps, /trace, and /open-trace switch inspector views. /quit exits or cancels.", width),
 		"",
 		"Navigation",
 		m.help.FullHelpView(m.fullHelp()),
@@ -2706,10 +2870,12 @@ func (m *model) shortHelp() []key.Binding {
 		return []key.Binding{keyAllow, keyDeny, keyRemember, keyHelp}
 	case modeTask:
 		return []key.Binding{keyEnter, keySlashHelp, keySlashHistory, keySlashClear, keyEsc}
+	case modeChat, modeContinue:
+		return []key.Binding{keyEnter, keyEsc}
 	case modeCommand, modeSearch:
 		return []key.Binding{keyEnter, keyEsc}
 	default:
-		return []key.Binding{keyMove, keyOpen, keyTaskInput, keyHistory, keyCommand, keySearch, keyHelp, keyQuit}
+		return []key.Binding{keyMove, keyOpen, keyTaskInput, keyAskRun, keyContinueRun, keyHistory, keyCommand, keySearch, keyHelp, keyQuit}
 	}
 }
 
@@ -2731,7 +2897,8 @@ func (m *model) fullHelp() [][]key.Binding {
 		{keyScrollHalf, keyScrollPage, keyTab, keyOpen},
 		{keySearch, keyNext, keyPrev, keyCommand, keyHelp},
 		{keyDiff, keyTests, keySteps, keyTimeline, keyHistory, keyTrace, keyOpenTrace},
-		{keyTaskInput, keySlashHelp, keySlashHistory, keySlashClear, keySlashQuit},
+		{keyTaskInput, keyAskRun, keyContinueRun, keySlashChat, keySlashContinue},
+		{keySlashHelp, keySlashHistory, keySlashClear, keySlashQuit},
 		{keyAllow, keyDeny, keyRemember, keyExpandApproval},
 		{keyQuit, keyCancel},
 	}
@@ -3207,6 +3374,8 @@ func fallbackReviewWidth(snapshot RunSnapshot, width int) string {
 		"v inspect validation",
 		"s inspect steps",
 		"x inspect trace",
+		"a ask about run",
+		"c continue run",
 		"i new task",
 		"q quit",
 	} {
@@ -3921,6 +4090,8 @@ var (
 	keyNext            = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next match"))
 	keyPrev            = key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match"))
 	keyTaskInput       = key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "task input"))
+	keyAskRun          = key.NewBinding(key.WithKeys("a", ":chat"), key.WithHelp("a", "ask run"))
+	keyContinueRun     = key.NewBinding(key.WithKeys("c", ":continue"), key.WithHelp("c", "continue"))
 	keyCommand         = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
 	keyHelp            = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
 	keyDiff            = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
@@ -3941,6 +4112,8 @@ var (
 	keyTraceDebugDiff  = key.NewBinding(key.WithKeys("D", "ctrl+d", "d"), key.WithHelp("D/d", "debug/diff"))
 	keyTraceTabs       = key.NewBinding(key.WithKeys("tab", "1-6"), key.WithHelp("tab/1-6", "trace tabs"))
 	keySlashHelp       = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
+	keySlashChat       = key.NewBinding(key.WithKeys("/chat"), key.WithHelp("/chat", "ask"))
+	keySlashContinue   = key.NewBinding(key.WithKeys("/continue"), key.WithHelp("/continue", "continue"))
 	keySlashHistory    = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
 	keySlashClear      = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
 	keySlashQuit       = key.NewBinding(key.WithKeys("/quit"), key.WithHelp("/quit", "quit"))

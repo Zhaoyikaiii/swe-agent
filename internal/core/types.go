@@ -32,12 +32,20 @@ type Usage struct {
 	CostUSD      float64 `json:"cost_usd" yaml:"cost_usd"`
 }
 
+type ModelMode string
+
+const (
+	ModelModeAction ModelMode = "action"
+	ModelModeChat   ModelMode = "chat"
+)
+
 type ModelRequest struct {
 	Messages    []Message  `json:"messages"`
 	Tools       []ToolSpec `json:"tools,omitempty"`
 	Temperature float64    `json:"temperature"`
 	MaxTokens   int        `json:"max_tokens"`
 	WorkingDir  string     `json:"working_dir,omitempty"`
+	Mode        ModelMode  `json:"mode,omitempty"`
 }
 
 type ModelResponse struct {

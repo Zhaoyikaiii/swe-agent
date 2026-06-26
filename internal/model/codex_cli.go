@@ -345,6 +345,13 @@ func extractText(value any) string {
 }
 
 func buildCodexPrompt(req core.ModelRequest) string {
+	if req.Mode == core.ModelModeChat {
+		return buildCodexChatPrompt(req)
+	}
+	return buildCodexActionPrompt(req)
+}
+
+func buildCodexActionPrompt(req core.ModelRequest) string {
 	var b strings.Builder
 	b.WriteString("You are the decision model inside a Go SWE-agent.\n")
 	b.WriteString("Do not solve the task by editing files yourself. Do not make final prose unless submitting.\n")
@@ -374,6 +381,26 @@ func buildCodexPrompt(req core.ModelRequest) string {
 		b.WriteByte('\n')
 	}
 	b.WriteString("Conversation so far:\n")
+	for _, msg := range req.Messages {
+		name := msg.Name
+		if name != "" {
+			name = " name=" + name
+		}
+		fmt.Fprintf(&b, "\n<%s%s>\n%s\n</%s>\n", msg.Role, name, msg.Content, msg.Role)
+	}
+	return b.String()
+}
+
+func buildCodexChatPrompt(req core.ModelRequest) string {
+	var b strings.Builder
+	b.WriteString("You are answering directly in prose for the Go SWE-agent UI.\n")
+	b.WriteString("Do not emit tool calls, shell commands to execute, or fenced swe_shell action blocks.\n")
+	b.WriteString("Use only the conversation context provided by the outer application.\n")
+	b.WriteString("If the provided context lacks evidence, say what evidence is missing.\n\n")
+	if req.WorkingDir != "" {
+		fmt.Fprintf(&b, "Workspace: %s\n\n", req.WorkingDir)
+	}
+	b.WriteString("Conversation:\n")
 	for _, msg := range req.Messages {
 		name := msg.Name
 		if name != "" {
