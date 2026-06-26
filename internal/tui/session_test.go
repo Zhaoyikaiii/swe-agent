@@ -325,7 +325,7 @@ func TestTraceWorkspaceCompactTabsHideDebugDump(t *testing.T) {
 	}
 
 	frontier := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabFrontier}, 100, record.Result.TrajectoryPath)
-	for _, want := range []string{"Active: Resolve the Go import cycle", "Next", "Open", "Which shared type"} {
+	for _, want := range []string{"Next Work", "Active", "Resolve the Go import cycle", "Action", "Open", "Which shared type"} {
 		if !strings.Contains(frontier, want) {
 			t.Fatalf("expected compact frontier to contain %q, got:\n%s", want, frontier)
 		}
@@ -352,25 +352,25 @@ func TestTraceWorkspaceCompactTabsHideDebugDump(t *testing.T) {
 	}
 
 	events := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabEvents}, 100, record.Result.TrajectoryPath)
-	for _, want := range []string{"symptom_detected", "direction_created", "evidence_added"} {
+	for _, want := range []string{"Event Stream", "Symptom", "Direction", "Evidence"} {
 		if !strings.Contains(events, want) {
 			t.Fatalf("expected compact events to contain %q, got:\n%s", want, events)
 		}
 	}
-	for _, unwanted := range []string{"trace_span_ended", "prompt_snapshot", "frontier_updated"} {
+	for _, unwanted := range []string{"trace_span_ended", "prompt_snapshot", "frontier_updated", "symptom_detected"} {
 		if strings.Contains(events, unwanted) {
 			t.Fatalf("expected compact events to hide %q, got:\n%s", unwanted, events)
 		}
 	}
 	eventsDebug := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabEvents, Debug: true}, 100, record.Result.TrajectoryPath)
-	for _, want := range []string{"trace_span_ended", "prompt_snapshot", "frontier_updated"} {
+	for _, want := range []string{"Trace span", "Prompt", "Frontier"} {
 		if !strings.Contains(eventsDebug, want) {
 			t.Fatalf("expected debug events to contain %q, got:\n%s", want, eventsDebug)
 		}
 	}
 
 	prompt := traceWorkspaceViewWidth(record, traceWorkspaceState{Tab: traceTabPrompt}, 100, record.Result.TrajectoryPath)
-	for _, want := range []string{"Latest Prompt: prompt-1 step=1", "Context", "Investigation Frontier: yes"} {
+	for _, want := range []string{"Prompt Context", "Latest Prompt", "prompt-1 step=1", "Context", "Investigation Frontier: yes"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected compact prompt to contain %q, got:\n%s", want, prompt)
 		}
@@ -948,7 +948,7 @@ func TestWideTraceUsesFullWidthWorkspace(t *testing.T) {
 	}
 }
 
-func TestTraceWorkspaceJKScrollsNonTreeTabs(t *testing.T) {
+func TestTraceWorkspaceJKMovesEventCursor(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	model.width = 120
 	model.height = 12
@@ -958,16 +958,162 @@ func TestTraceWorkspaceJKScrollsNonTreeTabs(t *testing.T) {
 	model.openTraceWorkspace()
 	model.setTraceTab("4")
 
-	before := model.detail.YOffset
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 
-	if model.detail.YOffset <= before {
-		t.Fatalf("expected j to scroll events tab, before=%d after=%d\n%s", before, model.detail.YOffset, model.detail.View())
+	if model.traceView.EventCursor != 1 {
+		t.Fatalf("expected j to move event cursor to 1, got %d\n%s", model.traceView.EventCursor, model.detail.View())
+	}
+	if model.detail.YOffset != 0 {
+		t.Fatalf("expected event cursor movement to avoid viewport scrolling, got offset=%d", model.detail.YOffset)
 	}
 
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
-	if model.detail.YOffset != before {
-		t.Fatalf("expected k to scroll events tab back to %d, got %d", before, model.detail.YOffset)
+	if model.traceView.EventCursor != 0 {
+		t.Fatalf("expected k to move event cursor back to 0, got %d", model.traceView.EventCursor)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if model.traceView.EventPane != tracePaneDetail {
+		t.Fatalf("expected l to focus event detail pane, got %v", model.traceView.EventPane)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	if model.traceView.EventTab != traceEventData {
+		t.Fatalf("expected ] to switch event detail tab to data, got %v", model.traceView.EventTab)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+	if model.traceView.EventTab != traceEventOverview {
+		t.Fatalf("expected [ to switch event detail tab back to overview, got %v", model.traceView.EventTab)
+	}
+}
+
+func TestTraceWorkspaceEventsWideSplitAndDetailTabs(t *testing.T) {
+	record := taskRecord{
+		Task: core.Task{Text: "fix failing tests", Repo: "/repo"},
+		Events: []core.Event{
+			{Type: "user_task", Data: map[string]any{"task": "fix failing tests", "repo": "/repo"}},
+			{Type: "model_response", Data: map[string]any{"content": "I will run the focused tests."}},
+			{Type: "tool_call", Data: map[string]any{"tool": "shell", "args": map[string]any{"command": "go test ./internal/tui"}}},
+			{Type: "tool_result", Data: map[string]any{"tool": "shell", "code": 1, "output_preview": "FAIL TestTraceWorkspaceEvents"}},
+		},
+	}
+	state := traceWorkspaceState{
+		Tab:         traceTabEvents,
+		EventCursor: 2,
+		EventPane:   tracePaneDetail,
+	}
+
+	rendered := traceWorkspaceView(record, state, 140, 18, "trace.jsonl")
+
+	for _, want := range []string{
+		"Event Stream",
+		"Selected Event [active]",
+		"[Overview]  Data  Trace  Raw",
+		"Action",
+		"Command: go test ./internal/tui",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected events split to contain %q, got:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestTraceWorkspaceCollectionKeysMoveCursorAndTabs(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 140
+	model.height = 18
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix go test import cycle", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+	model.setTraceTab("2")
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if model.traceView.CollectionCursor != 1 {
+		t.Fatalf("expected j to move collection cursor to 1, got %d", model.traceView.CollectionCursor)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if model.traceView.CollectionPane != tracePaneDetail {
+		t.Fatalf("expected l to focus collection detail pane, got %v", model.traceView.CollectionPane)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	if model.traceView.CollectionTab != traceCollectionData {
+		t.Fatalf("expected ] to switch collection detail tab to data, got %v", model.traceView.CollectionTab)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+	if model.traceView.CollectionTab != traceCollectionOverview {
+		t.Fatalf("expected [ to switch collection detail tab back to overview, got %v", model.traceView.CollectionTab)
+	}
+}
+
+func TestTraceWorkspaceCollectionTabsUseConsistentSplit(t *testing.T) {
+	nextRecord := taskRecord{
+		Task:   core.Task{Text: "fix go test import cycle", Repo: "/repo"},
+		Events: mockImportCycleProblemTraceEvents(),
+		Result: agentpkg.Result{TrajectoryPath: "trace.jsonl"},
+	}
+	promptRecord := taskRecord{
+		Task:   core.Task{Text: "fix it", Repo: "/repo"},
+		Events: scrollableTraceWorkspaceEvents(),
+		Result: agentpkg.Result{TrajectoryPath: "trace.jsonl"},
+	}
+
+	cases := []struct {
+		name   string
+		record taskRecord
+		state  traceWorkspaceState
+		want   []string
+	}{
+		{
+			name:   "next",
+			record: nextRecord,
+			state: traceWorkspaceState{
+				Tab:            traceTabFrontier,
+				CollectionPane: tracePaneDetail,
+			},
+			want: []string{"Next Work", "Selected Next [active]", "[Overview]  Data  Raw", "Resolve the Go import cycle"},
+		},
+		{
+			name:   "memory",
+			record: nextRecord,
+			state: traceWorkspaceState{
+				Tab:            traceTabMemory,
+				Debug:          true,
+				CollectionPane: tracePaneDetail,
+			},
+			want: []string{"Memory Sources", "Selected Memory [active]", "[Overview]  Data  Raw", "Policy"},
+		},
+		{
+			name:   "prompt",
+			record: promptRecord,
+			state: traceWorkspaceState{
+				Tab:            traceTabPrompt,
+				CollectionPane: tracePaneDetail,
+			},
+			want: []string{"Prompt Context", "Selected Prompt [active]", "[Overview]  Data  Raw", "Latest Prompt"},
+		},
+		{
+			name:   "learn",
+			record: promptRecord,
+			state: traceWorkspaceState{
+				Tab:            traceTabCards,
+				CollectionPane: tracePaneDetail,
+			},
+			want: []string{"Draft Memory Cards", "Selected Card [active]", "[Overview]  Data  Raw", "run_summary"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rendered := traceWorkspaceView(tc.record, tc.state, 140, 18, tc.record.Result.TrajectoryPath)
+			for _, want := range tc.want {
+				if !strings.Contains(rendered, want) {
+					t.Fatalf("expected %s collection split to contain %q, got:\n%s", tc.name, want, rendered)
+				}
+			}
+		})
 	}
 }
 

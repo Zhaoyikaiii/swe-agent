@@ -177,16 +177,41 @@ const (
 	traceDetailDebug
 )
 
+type traceEventTab int
+
+const (
+	traceEventOverview traceEventTab = iota
+	traceEventData
+	traceEventTrace
+	traceEventRaw
+)
+
+type traceCollectionTab int
+
+const (
+	traceCollectionOverview traceCollectionTab = iota
+	traceCollectionData
+	traceCollectionRaw
+)
+
 type traceWorkspaceState struct {
-	Tab          traceTab
-	Cursor       int
-	SelectedID   string
-	Expanded     map[string]bool
-	FollowLive   bool
-	Debug        bool
-	Pane         tracePane
-	DetailTab    traceDetailTab
-	DetailOffset int
+	Tab              traceTab
+	Cursor           int
+	SelectedID       string
+	Expanded         map[string]bool
+	FollowLive       bool
+	Debug            bool
+	Pane             tracePane
+	DetailTab        traceDetailTab
+	DetailOffset     int
+	EventCursor      int
+	EventOffset      int
+	EventPane        tracePane
+	EventTab         traceEventTab
+	CollectionCursor int
+	CollectionOffset int
+	CollectionPane   tracePane
+	CollectionTab    traceCollectionTab
 }
 
 type sidebarMode int
@@ -514,6 +539,68 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		case "d":
 			m.toggleTraceDebug()
 			return nil
+		}
+		if m.traceView.Tab == traceTabEvents {
+			switch keyString {
+			case "h", "left":
+				m.setTraceEventPane(tracePaneTree)
+				return nil
+			case "l", "right":
+				m.setTraceEventPane(tracePaneDetail)
+				return nil
+			case "[":
+				m.cycleTraceEventTab(-1)
+				return nil
+			case "]":
+				m.cycleTraceEventTab(1)
+				return nil
+			case "j", "down":
+				m.moveTraceEventCursor(1)
+				return nil
+			case "k", "up":
+				m.moveTraceEventCursor(-1)
+				return nil
+			case "pgdown":
+				m.moveTraceEventDetail(1)
+				return nil
+			case "pgup":
+				m.moveTraceEventDetail(-1)
+				return nil
+			case "enter", "o":
+				m.openTraceEvent()
+				return nil
+			}
+		}
+		if isTraceCollectionTab(m.traceView.Tab) {
+			switch keyString {
+			case "h", "left":
+				m.setTraceCollectionPane(tracePaneTree)
+				return nil
+			case "l", "right":
+				m.setTraceCollectionPane(tracePaneDetail)
+				return nil
+			case "[":
+				m.cycleTraceCollectionTab(-1)
+				return nil
+			case "]":
+				m.cycleTraceCollectionTab(1)
+				return nil
+			case "j", "down":
+				m.moveTraceCollectionCursor(1)
+				return nil
+			case "k", "up":
+				m.moveTraceCollectionCursor(-1)
+				return nil
+			case "pgdown":
+				m.moveTraceCollectionDetail(1)
+				return nil
+			case "pgup":
+				m.moveTraceCollectionDetail(-1)
+				return nil
+			case "enter", "o":
+				m.openTraceCollectionItem()
+				return nil
+			}
 		}
 		if m.traceView.Tab == traceTabTrace {
 			switch keyString {
@@ -1498,6 +1585,8 @@ func (m *model) cycleTraceTab(delta int) {
 	next := (int(m.traceView.Tab) + delta + total) % total
 	m.traceView.Tab = traceTab(next)
 	m.traceView.DetailOffset = 0
+	m.traceView.EventOffset = 0
+	m.traceView.CollectionOffset = 0
 	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
 	m.detail.GotoTop()
 	m.updateDetail()
@@ -1554,6 +1643,191 @@ func (m *model) clampTraceDetailOffset() {
 	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
 	maxOffset := traceDetailMaxOffset(vm, m.traceView, m.detail.Width, m.detail.Height)
 	m.traceView.DetailOffset = clamp(m.traceView.DetailOffset, 0, maxOffset)
+}
+
+func (m *model) setTraceEventPane(pane tracePane) {
+	if m.traceView.Tab != traceTabEvents {
+		return
+	}
+	m.traceView.EventPane = pane
+	switch pane {
+	case tracePaneDetail:
+		m.status = "events: detail"
+	default:
+		m.status = "events: stream"
+	}
+	m.updateDetail()
+}
+
+func (m *model) cycleTraceEventTab(delta int) {
+	if m.traceView.Tab != traceTabEvents {
+		return
+	}
+	total := int(traceEventRaw) + 1
+	next := (int(m.traceView.EventTab) + delta + total) % total
+	m.traceView.EventTab = traceEventTab(next)
+	m.traceView.EventPane = tracePaneDetail
+	m.traceView.EventOffset = 0
+	m.status = "event detail: " + traceEventTabLabel(m.traceView.EventTab)
+	m.updateDetail()
+}
+
+func (m *model) moveTraceEventDetail(delta int) {
+	if m.traceView.Tab != traceTabEvents {
+		return
+	}
+	m.traceView.EventOffset = max(0, m.traceView.EventOffset+delta)
+	m.updateDetail()
+}
+
+func (m *model) clampTraceEventOffset() {
+	if m.view != viewTrace || m.traceView.Tab != traceTabEvents {
+		return
+	}
+	if m.traceView.EventOffset <= 0 {
+		m.traceView.EventOffset = 0
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		m.traceView.EventOffset = 0
+		return
+	}
+	maxOffset := traceEventDetailMaxOffset(record.Events, m.traceView, m.detail.Width, m.detail.Height)
+	m.traceView.EventOffset = clamp(m.traceView.EventOffset, 0, maxOffset)
+}
+
+func (m *model) setTraceCollectionPane(pane tracePane) {
+	if !isTraceCollectionTab(m.traceView.Tab) {
+		return
+	}
+	m.traceView.CollectionPane = pane
+	switch pane {
+	case tracePaneDetail:
+		m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + ": detail"
+	default:
+		m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + ": list"
+	}
+	m.updateDetail()
+}
+
+func (m *model) cycleTraceCollectionTab(delta int) {
+	if !isTraceCollectionTab(m.traceView.Tab) {
+		return
+	}
+	total := int(traceCollectionRaw) + 1
+	next := (int(m.traceView.CollectionTab) + delta + total) % total
+	m.traceView.CollectionTab = traceCollectionTab(next)
+	m.traceView.CollectionPane = tracePaneDetail
+	m.traceView.CollectionOffset = 0
+	m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail: " + traceCollectionTabLabel(m.traceView.CollectionTab)
+	m.updateDetail()
+}
+
+func (m *model) moveTraceCollectionDetail(delta int) {
+	if !isTraceCollectionTab(m.traceView.Tab) {
+		return
+	}
+	m.traceView.CollectionOffset = max(0, m.traceView.CollectionOffset+delta)
+	m.updateDetail()
+}
+
+func (m *model) clampTraceCollectionOffset() {
+	if m.view != viewTrace || !isTraceCollectionTab(m.traceView.Tab) {
+		return
+	}
+	if m.traceView.CollectionOffset <= 0 {
+		m.traceView.CollectionOffset = 0
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		m.traceView.CollectionOffset = 0
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	maxOffset := traceCollectionDetailMaxOffset(buildTraceCollectionVM(m.traceView.Tab, vm.Trace, m.traceView.Debug), m.traceView, m.detail.Width, m.detail.Height)
+	m.traceView.CollectionOffset = clamp(m.traceView.CollectionOffset, 0, maxOffset)
+}
+
+func (m *model) moveTraceCollectionCursor(delta int) {
+	if !isTraceCollectionTab(m.traceView.Tab) {
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	collection := buildTraceCollectionVM(m.traceView.Tab, vm.Trace, m.traceView.Debug)
+	if len(collection.Rows) == 0 {
+		m.traceView.CollectionCursor = 0
+		m.traceView.CollectionOffset = 0
+		m.updateDetail()
+		return
+	}
+	m.traceView.CollectionCursor = clamp(m.traceView.CollectionCursor+delta, 0, len(collection.Rows)-1)
+	m.traceView.CollectionOffset = 0
+	m.updateDetail()
+}
+
+func (m *model) openTraceCollectionItem() {
+	if !isTraceCollectionTab(m.traceView.Tab) {
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	vm := buildTraceWorkspaceVM(*record, m.traceView, m.trajectoryPath())
+	collection := buildTraceCollectionVM(m.traceView.Tab, vm.Trace, m.traceView.Debug)
+	if len(collection.Rows) == 0 {
+		return
+	}
+	m.traceView.CollectionCursor = clamp(m.traceView.CollectionCursor, 0, len(collection.Rows)-1)
+	m.traceView.CollectionPane = tracePaneDetail
+	m.traceView.CollectionOffset = 0
+	m.status = strings.ToLower(traceTabLabel(m.traceView.Tab)) + " detail: " + traceCollectionTabLabel(m.traceView.CollectionTab)
+	m.updateDetail()
+}
+
+func (m *model) moveTraceEventCursor(delta int) {
+	if m.traceView.Tab != traceTabEvents {
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	rows := buildTraceEventRows(record.Events, m.traceView.Debug)
+	if len(rows) == 0 {
+		m.traceView.EventCursor = 0
+		m.traceView.EventOffset = 0
+		m.updateDetail()
+		return
+	}
+	m.traceView.EventCursor = clamp(m.traceView.EventCursor+delta, 0, len(rows)-1)
+	m.traceView.EventOffset = 0
+	m.updateDetail()
+}
+
+func (m *model) openTraceEvent() {
+	if m.traceView.Tab != traceTabEvents {
+		return
+	}
+	record := m.selectedTaskRecord()
+	if record == nil {
+		return
+	}
+	rows := buildTraceEventRows(record.Events, m.traceView.Debug)
+	if len(rows) == 0 {
+		return
+	}
+	m.traceView.EventCursor = clamp(m.traceView.EventCursor, 0, len(rows)-1)
+	m.traceView.EventPane = tracePaneDetail
+	m.traceView.EventOffset = 0
+	m.status = "event detail: " + traceEventTabLabel(m.traceView.EventTab)
+	m.updateDetail()
 }
 
 func (m *model) moveTraceCursor(delta int) {
@@ -1635,6 +1909,10 @@ func (m *model) toggleTraceDebug() {
 		m.status = "trace debug: off"
 	}
 	m.traceView.DetailOffset = 0
+	m.traceView.EventCursor = 0
+	m.traceView.EventOffset = 0
+	m.traceView.CollectionCursor = 0
+	m.traceView.CollectionOffset = 0
 	m.detail.GotoTop()
 	m.updateDetail()
 }
@@ -1661,6 +1939,8 @@ func (m *model) setTraceTab(key string) {
 		m.traceView.Tab = traceTabCards
 	}
 	m.traceView.DetailOffset = 0
+	m.traceView.EventOffset = 0
+	m.traceView.CollectionOffset = 0
 	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
 	m.detail.GotoTop()
 	m.updateDetail()
@@ -1900,6 +2180,8 @@ func (m *model) sidebarListHeight() int {
 func (m *model) updateDetail() {
 	m.syncDetailSize()
 	m.clampTraceDetailOffset()
+	m.clampTraceEventOffset()
+	m.clampTraceCollectionOffset()
 	m.detail.SetContent(m.detailContent())
 }
 

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/local/swe-agent/internal/core"
 	"github.com/local/swe-agent/internal/problemtrace"
 )
@@ -22,16 +23,12 @@ func traceWorkspaceView(record taskRecord, state traceWorkspaceState, width int,
 	b.WriteString(traceTabs(state.Tab))
 	b.WriteString("\n\n")
 	switch state.Tab {
-	case traceTabFrontier:
-		renderTraceFrontier(&b, vm.Trace, width, state.Debug)
-	case traceTabMemory:
-		renderTraceMemory(&b, vm.Trace, width, state.Debug)
+	case traceTabFrontier, traceTabMemory:
+		renderTraceCollectionWorkspace(&b, buildTraceCollectionVM(state.Tab, vm.Trace, state.Debug), state, width, height)
 	case traceTabEvents:
-		renderTraceEvents(&b, record.Events, width, state.Debug)
-	case traceTabPrompt:
-		renderTracePrompts(&b, vm.Trace, width, state.Debug)
-	case traceTabCards:
-		renderTraceCards(&b, vm.Trace, width, state.Debug)
+		renderTraceEventsWorkspace(&b, record.Events, state, width, height)
+	case traceTabPrompt, traceTabCards:
+		renderTraceCollectionWorkspace(&b, buildTraceCollectionVM(state.Tab, vm.Trace, state.Debug), state, width, height)
 	default:
 		renderTraceTreeTab(&b, vm, state, width, height, record)
 	}
@@ -110,99 +107,634 @@ func renderTraceSpanGraph(b *strings.Builder, trace problemtrace.ProblemTrace, w
 	}
 }
 
-func renderTraceFrontier(b *strings.Builder, trace problemtrace.ProblemTrace, width int, debug bool) {
-	writeField(b, "Active", activeDirectionSummary(trace), width)
+type TraceCollectionVM struct {
+	Title       string
+	DetailTitle string
+	Empty       string
+	Rows        []TraceCollectionRowVM
+}
 
-	writeSection(b, "Next")
-	if len(trace.Frontier.RecommendedActions) == 0 {
-		b.WriteString("No recommended action yet.\n")
-	} else {
-		for _, action := range topActions(trace.Frontier.RecommendedActions, 3) {
-			b.WriteString(wrapText(fmt.Sprintf("- %s", action.Action), width))
-			b.WriteByte('\n')
-			if debug && action.Rationale != "" {
-				b.WriteString(indentText(wrapText(action.Rationale, remainingWidth(width, 2)), 2))
-				b.WriteByte('\n')
-			}
-			if debug {
-				for _, expected := range topStrings(action.ExpectedEvidence, 3) {
-					b.WriteString(indentText(wrapText("expected: "+expected, remainingWidth(width, 2)), 2))
-					b.WriteByte('\n')
-				}
-			}
+type TraceCollectionRowVM struct {
+	Index   int
+	Kind    string
+	Icon    string
+	Status  string
+	Title   string
+	Summary string
+	Data    any
+	Raw     any
+}
+
+func isTraceCollectionTab(tab traceTab) bool {
+	switch tab {
+	case traceTabFrontier, traceTabMemory, traceTabPrompt, traceTabCards:
+		return true
+	default:
+		return false
+	}
+}
+
+func buildTraceCollectionVM(tab traceTab, trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
+	switch tab {
+	case traceTabFrontier:
+		return buildTraceNextCollection(trace, debug)
+	case traceTabMemory:
+		return buildTraceMemoryCollection(trace, debug)
+	case traceTabPrompt:
+		return buildTracePromptCollection(trace, debug)
+	case traceTabCards:
+		return buildTraceLearnCollection(trace, debug)
+	default:
+		return TraceCollectionVM{
+			Title:       "Items",
+			DetailTitle: "Selected Item",
+			Empty:       "No items recorded.",
 		}
 	}
-	renderStringList(b, "Open", topStrings(trace.Frontier.OpenQuestions, 3), width)
+}
+
+func buildTraceNextCollection(trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
+	rows := []TraceCollectionRowVM{}
+	activeID := strings.TrimSpace(trace.Frontier.ActiveDirectionID)
+	activeSummary := activeDirectionSummary(trace)
+	activeRaw := traceDirectionByID(trace, activeID)
+	rows = append(rows, TraceCollectionRowVM{
+		Index:   len(rows),
+		Kind:    "direction",
+		Icon:    "D",
+		Status:  valueOrDefault(activeID, "none"),
+		Title:   "Active",
+		Summary: activeSummary,
+		Data: map[string]any{
+			"active_direction_id": activeID,
+			"summary":             activeSummary,
+		},
+		Raw: activeRaw,
+	})
+
+	actions := trace.Frontier.RecommendedActions
 	if !debug {
-		return
+		actions = topActions(actions, 3)
+	}
+	for _, action := range actions {
+		rows = append(rows, TraceCollectionRowVM{
+			Index:   len(rows),
+			Kind:    "action",
+			Icon:    ">",
+			Status:  "next",
+			Title:   "Action",
+			Summary: action.Action,
+			Data: map[string]any{
+				"action":            action.Action,
+				"tool":              action.Tool,
+				"command":           action.Command,
+				"rationale":         action.Rationale,
+				"expected_evidence": action.ExpectedEvidence,
+				"direction_id":      action.DirectionID,
+				"priority":          action.Priority,
+			},
+			Raw: action,
+		})
 	}
 
-	renderDirectionsDebug(b, trace, width)
-	renderStringList(b, "Stop Conditions", trace.Frontier.StopConditions, width)
-	renderStringList(b, "Risks", trace.Frontier.Risks, width)
+	questions := trace.Frontier.OpenQuestions
+	if !debug {
+		questions = topStrings(questions, 3)
+	}
+	for _, question := range questions {
+		rows = append(rows, TraceCollectionRowVM{
+			Index:   len(rows),
+			Kind:    "question",
+			Icon:    "?",
+			Status:  "open",
+			Title:   "Open",
+			Summary: question,
+			Data:    map[string]any{"question": question},
+			Raw:     question,
+		})
+	}
+
+	if debug {
+		for _, direction := range trace.Directions {
+			rows = append(rows, TraceCollectionRowVM{
+				Index:   len(rows),
+				Kind:    "direction",
+				Icon:    "D",
+				Status:  string(direction.Status),
+				Title:   "Directions",
+				Summary: displayDirectionTitle(direction.ID, direction.Hypothesis),
+				Data: map[string]any{
+					"id":         direction.ID,
+					"hypothesis": direction.Hypothesis,
+					"rationale":  direction.Rationale,
+					"status":     direction.Status,
+					"priority":   direction.Priority,
+				},
+				Raw: direction,
+			})
+		}
+		for _, stop := range trace.Frontier.StopConditions {
+			rows = append(rows, TraceCollectionRowVM{
+				Index:   len(rows),
+				Kind:    "stop",
+				Icon:    "!",
+				Status:  "stop",
+				Title:   "Stop Conditions",
+				Summary: stop,
+				Data:    map[string]any{"stop_condition": stop},
+				Raw:     stop,
+			})
+		}
+		for _, risk := range trace.Frontier.Risks {
+			rows = append(rows, TraceCollectionRowVM{
+				Index:   len(rows),
+				Kind:    "risk",
+				Icon:    "!",
+				Status:  "risk",
+				Title:   "Risks",
+				Summary: risk,
+				Data:    map[string]any{"risk": risk},
+				Raw:     risk,
+			})
+		}
+	}
+
+	return TraceCollectionVM{
+		Title:       "Next Work",
+		DetailTitle: "Selected Next",
+		Empty:       "No recommended action yet.",
+		Rows:        rows,
+	}
 }
 
-func renderDirectionsDebug(b *strings.Builder, trace problemtrace.ProblemTrace, width int) {
-	if len(trace.Directions) == 0 {
-		return
-	}
-	writeSection(b, "Directions")
-	for _, direction := range trace.Directions {
-		line := fmt.Sprintf("%s  %s  priority=%d", direction.Status, displayDirectionTitle(direction.ID, direction.Hypothesis), direction.Priority)
-		b.WriteString(wrapText(line, width))
-		b.WriteByte('\n')
-		if direction.Rationale != "" {
-			b.WriteString(indentText(wrapText(direction.Rationale, remainingWidth(width, 2)), 2))
-			b.WriteByte('\n')
-		}
-		for _, evidence := range direction.SupportingEvidence {
-			b.WriteString(indentText(wrapText("supports: "+evidence.Summary, remainingWidth(width, 2)), 2))
-			b.WriteByte('\n')
-		}
-		for _, evidence := range direction.RefutingEvidence {
-			b.WriteString(indentText(wrapText("refutes: "+evidence.Summary, remainingWidth(width, 2)), 2))
-			b.WriteByte('\n')
-		}
-	}
-}
-
-func renderTraceMemory(b *strings.Builder, trace problemtrace.ProblemTrace, width int, debug bool) {
-	writeSection(b, "Memory")
-	if len(trace.Memories) == 0 {
-		b.WriteString("No memory used in this run.\n")
-		if debug {
-			writeSection(b, "Policy")
-			for _, line := range []string{
-				"Memory is hypothesis input, not fact.",
-				"Cards remain draft until review.",
-				"Secrets and hidden reasoning are not exported.",
-			} {
-				b.WriteString(wrapText("- "+line, width))
-				b.WriteByte('\n')
-			}
-		}
-		return
-	}
+func buildTraceMemoryCollection(trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
+	rows := []TraceCollectionRowVM{}
 	for _, memory := range trace.Memories {
 		status := valueOrDefault(memory.Status, "used")
-		line := fmt.Sprintf("%s  %.2f  %s", status, memory.Similarity, memory.Summary)
-		b.WriteString(wrapText(line, width))
-		b.WriteByte('\n')
-		if debug && memory.Reason != "" {
-			b.WriteString(indentText(wrapText(memory.Reason, remainingWidth(width, 2)), 2))
-			b.WriteByte('\n')
-		}
+		rows = append(rows, TraceCollectionRowVM{
+			Index:   len(rows),
+			Kind:    "memory",
+			Icon:    "M",
+			Status:  status,
+			Title:   "Memory",
+			Summary: memory.Summary,
+			Data: map[string]any{
+				"id":         memory.ID,
+				"status":     status,
+				"similarity": memory.Similarity,
+				"summary":    memory.Summary,
+				"reason":     memory.Reason,
+				"source_run": memory.SourceRunID,
+			},
+			Raw: memory,
+		})
 	}
 	if debug {
-		writeSection(b, "Policy")
-		for _, line := range []string{
-			"Memory is hypothesis input, not fact.",
-			"Cards remain draft until review.",
-			"Secrets and hidden reasoning are not exported.",
-		} {
-			b.WriteString(wrapText("- "+line, width))
+		for _, policy := range traceMemoryPolicies() {
+			rows = append(rows, TraceCollectionRowVM{
+				Index:   len(rows),
+				Kind:    "policy",
+				Icon:    "P",
+				Status:  "policy",
+				Title:   "Policy",
+				Summary: policy,
+				Data:    map[string]any{"policy": policy},
+				Raw:     policy,
+			})
+		}
+	}
+	return TraceCollectionVM{
+		Title:       "Memory Sources",
+		DetailTitle: "Selected Memory",
+		Empty:       "No memory used in this run.",
+		Rows:        rows,
+	}
+}
+
+func buildTracePromptCollection(trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
+	rows := []TraceCollectionRowVM{}
+	if len(trace.Prompts) == 0 {
+		return TraceCollectionVM{
+			Title:       "Prompt Context",
+			DetailTitle: "Selected Prompt",
+			Empty:       "No prompt snapshots recorded.",
+		}
+	}
+
+	prompts := trace.Prompts
+	if !debug {
+		prompts = trace.Prompts[len(trace.Prompts)-1:]
+	}
+	for _, prompt := range prompts {
+		status := "latest"
+		title := "Latest Prompt"
+		if debug {
+			status = "snapshot"
+			title = "Prompt"
+		}
+		summary := tracePromptSummary(prompt)
+		if debug && strings.TrimSpace(prompt.Model) != "" {
+			summary += " Model: " + strings.TrimSpace(prompt.Model)
+		}
+		rows = append(rows, TraceCollectionRowVM{
+			Index:   len(rows),
+			Kind:    "prompt",
+			Icon:    "P",
+			Status:  status,
+			Title:   title,
+			Summary: summary,
+			Data: map[string]any{
+				"id":             prompt.ID,
+				"step":           prompt.Step,
+				"model":          prompt.Model,
+				"messages":       prompt.MessageCount,
+				"tools":          prompt.ToolCount,
+				"token_estimate": prompt.TokenEstimate,
+			},
+			Raw: prompt,
+		})
+		for _, block := range prompt.Blocks {
+			if !debug && !isCompactPromptBlock(block.Kind) {
+				continue
+			}
+			statusText := "no"
+			if block.Included {
+				statusText = "yes"
+			}
+			summary := fmt.Sprintf("%s: %s", valueOrDefault(block.Title, block.Kind), statusText)
+			if debug {
+				summary = fmt.Sprintf("%s included=%s", valueOrDefault(block.Title, block.Kind), statusText)
+			}
+			if block.Count > 0 {
+				summary += fmt.Sprintf(" count=%d", block.Count)
+			}
+			rows = append(rows, TraceCollectionRowVM{
+				Index:   len(rows),
+				Kind:    "prompt_block",
+				Icon:    "C",
+				Status:  statusText,
+				Title:   "Context",
+				Summary: summary,
+				Data: map[string]any{
+					"kind":     block.Kind,
+					"title":    block.Title,
+					"included": block.Included,
+					"count":    block.Count,
+					"summary":  block.Summary,
+				},
+				Raw: block,
+			})
+		}
+	}
+
+	return TraceCollectionVM{
+		Title:       "Prompt Context",
+		DetailTitle: "Selected Prompt",
+		Empty:       "No prompt snapshots recorded.",
+		Rows:        rows,
+	}
+}
+
+func buildTraceLearnCollection(trace problemtrace.ProblemTrace, debug bool) TraceCollectionVM {
+	rows := []TraceCollectionRowVM{}
+	for _, card := range trace.Cards {
+		status := valueOrDefault(card.Status, "draft")
+		summary := fmt.Sprintf("%s %s", valueOrDefault(card.Kind, "card"), status)
+		if card.Summary != "" {
+			summary += "  " + card.Summary
+		}
+		rows = append(rows, TraceCollectionRowVM{
+			Index:   len(rows),
+			Kind:    "card",
+			Icon:    "L",
+			Status:  status,
+			Title:   "Card",
+			Summary: summary,
+			Data: map[string]any{
+				"id":           card.ID,
+				"kind":         card.Kind,
+				"status":       status,
+				"summary":      card.Summary,
+				"fix":          card.FixPattern,
+				"verification": card.Verification,
+			},
+			Raw: card,
+		})
+	}
+	return TraceCollectionVM{
+		Title:       "Draft Memory Cards",
+		DetailTitle: "Selected Card",
+		Empty:       "No draft memory cards yet. Cards are generated when the run finishes.",
+		Rows:        rows,
+	}
+}
+
+func renderTraceCollectionWorkspace(b *strings.Builder, collection TraceCollectionVM, state traceWorkspaceState, width int, height int) {
+	if width < 120 {
+		renderTraceCollectionListOnly(b, collection, state.CollectionCursor, width, height)
+		return
+	}
+
+	const gap = 3
+	leftWidth, rightWidth := traceEventSplitWidths(width, gap)
+	cursor := traceCollectionCursorForRows(state, collection.Rows)
+	left := renderTraceCollectionList(collection, cursor, leftWidth, state.CollectionPane == tracePaneTree)
+
+	var right string
+	if len(collection.Rows) == 0 {
+		right = collection.DetailTitle + "\n\nNo item selected.\n"
+	} else {
+		right = renderTraceCollectionDetail(collection, collection.Rows[cursor], state.CollectionTab, rightWidth, state.CollectionPane == tracePaneDetail)
+	}
+
+	panelHeight := traceEventSplitPanelHeight(left, right, height)
+	left = fitEventListAroundCursor(left, panelHeight, cursor)
+	right = fitHeightOffset(right, panelHeight, state.CollectionOffset)
+	divider := mutedStyle.Width(1).Render("|")
+
+	b.WriteString(lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Render(left),
+		" ",
+		divider,
+		" ",
+		lipgloss.NewStyle().Width(rightWidth).Render(right),
+	))
+}
+
+func renderTraceCollectionListOnly(b *strings.Builder, collection TraceCollectionVM, cursor int, width int, height int) {
+	cursor = traceCollectionCursorForRows(traceWorkspaceState{CollectionCursor: cursor}, collection.Rows)
+	content := renderTraceCollectionList(collection, cursor, width, true)
+	if height > 0 {
+		content = fitEventListAroundCursor(content, max(8, height-4), cursor)
+	}
+	b.WriteString(content)
+}
+
+func renderTraceCollectionList(collection TraceCollectionVM, cursor int, width int, active bool) string {
+	var b strings.Builder
+	title := collection.Title
+	if active {
+		title += " [active]"
+	}
+	b.WriteString(title)
+	b.WriteByte('\n')
+	b.WriteString("j/k move  h/l focus  [/] detail  d debug\n\n")
+
+	if len(collection.Rows) == 0 {
+		b.WriteString(collection.Empty)
+		if !strings.HasSuffix(collection.Empty, "\n") {
 			b.WriteByte('\n')
 		}
+		return b.String()
+	}
+
+	cursor = clamp(cursor, 0, len(collection.Rows)-1)
+	for i, row := range collection.Rows {
+		prefix := "  "
+		if i == cursor {
+			prefix = "> "
+		}
+
+		line := fmt.Sprintf(
+			"%s#%-3d %-2s %-16s %s",
+			prefix,
+			row.Index+1,
+			row.Icon,
+			truncateDisplay(row.Title, 16),
+			row.Summary,
+		)
+		line = truncateDisplay(line, width)
+
+		if i == cursor {
+			line = traceSelectedStyle.Width(width).Render(line)
+		} else {
+			line = collectionRowStyle(row).Render(line)
+		}
+
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+
+	return b.String()
+}
+
+func renderTraceCollectionDetail(collection TraceCollectionVM, row TraceCollectionRowVM, tab traceCollectionTab, width int, active bool) string {
+	var b strings.Builder
+	title := collection.DetailTitle
+	if active {
+		title += " [active]"
+	}
+	b.WriteString(title)
+	b.WriteByte('\n')
+	b.WriteString(traceCollectionTabs(tab))
+	b.WriteString("\n\n")
+
+	switch tab {
+	case traceCollectionData:
+		renderTraceCollectionData(&b, row, width)
+	case traceCollectionRaw:
+		renderTraceCollectionRaw(&b, row, width)
+	default:
+		renderTraceCollectionOverview(&b, row, width)
+	}
+
+	return b.String()
+}
+
+func renderTraceCollectionOverview(b *strings.Builder, row TraceCollectionRowVM, width int) {
+	writeField(b, "Kind", row.Kind, width)
+	writeField(b, "Status", row.Status, width)
+	writeField(b, "Title", row.Title, width)
+	writeField(b, "Summary", row.Summary, width)
+
+	switch typed := row.Raw.(type) {
+	case problemtrace.NextAction:
+		writeField(b, "Action", typed.Action, width)
+		writeField(b, "Tool", typed.Tool, width)
+		writeField(b, "Command", typed.Command, width)
+		writeField(b, "Rationale", typed.Rationale, width)
+		for _, expected := range topStrings(typed.ExpectedEvidence, 3) {
+			writeField(b, "Expected", expected, width)
+		}
+	case problemtrace.InvestigationDirection:
+		writeField(b, "Direction", displayDirectionTitle(typed.ID, typed.Hypothesis), width)
+		writeField(b, "Rationale", typed.Rationale, width)
+		writeField(b, "Priority", typed.Priority, width)
+	case problemtrace.MemoryUsage:
+		writeField(b, "Memory", typed.Summary, width)
+		writeField(b, "Similarity", typed.Similarity, width)
+		writeField(b, "Reason", typed.Reason, width)
+	case problemtrace.PromptSnapshot:
+		writeField(b, "Latest Prompt", tracePromptSummary(typed), width)
+		if row.Status == "snapshot" {
+			writeField(b, "Model", typed.Model, width)
+		}
+		writeField(b, "Tokens", typed.TokenEstimate, width)
+		writeField(b, "Messages", typed.MessageCount, width)
+		writeField(b, "Tools", typed.ToolCount, width)
+		writeSection(b, "Context")
+		for _, block := range typed.Blocks {
+			status := "no"
+			if block.Included {
+				status = "yes"
+			}
+			line := fmt.Sprintf("- %s: %s", valueOrDefault(block.Title, block.Kind), status)
+			if row.Status == "snapshot" {
+				line = fmt.Sprintf("- %s included=%s", valueOrDefault(block.Title, block.Kind), status)
+			}
+			if block.Count > 0 {
+				line += fmt.Sprintf(" count=%d", block.Count)
+			}
+			b.WriteString(wrapText(line, width))
+			b.WriteByte('\n')
+		}
+	case problemtrace.PromptBlock:
+		writeField(b, "Block", valueOrDefault(typed.Title, typed.Kind), width)
+		writeField(b, "Included", typed.Included, width)
+		writeField(b, "Count", typed.Count, width)
+		writeField(b, "Summary", typed.Summary, width)
+		writeField(b, "Content", typed.Content, width)
+	case problemtrace.MemoryCard:
+		writeField(b, "Card", valueOrDefault(typed.Kind, "card"), width)
+		writeField(b, "Status", valueOrDefault(typed.Status, "draft"), width)
+		writeField(b, "Summary", typed.Summary, width)
+		writeField(b, "Fix", typed.FixPattern, width)
+		writeField(b, "Verification", typed.Verification, width)
+		for _, evidence := range typed.Evidence {
+			writeField(b, "Evidence", evidence, width)
+		}
+	case string:
+		switch row.Kind {
+		case "question":
+			writeField(b, "Question", typed, width)
+		case "risk":
+			writeField(b, "Risk", typed, width)
+		case "stop":
+			writeField(b, "Stop Condition", typed, width)
+		case "policy":
+			writeField(b, "Policy", typed, width)
+		}
+	}
+}
+
+func renderTraceCollectionData(b *strings.Builder, row TraceCollectionRowVM, width int) {
+	if row.Data == nil {
+		b.WriteString("No structured data for this item.\n")
+		return
+	}
+	writeValueTree(b, "", row.Data, 0, width)
+}
+
+func renderTraceCollectionRaw(b *strings.Builder, row TraceCollectionRowVM, width int) {
+	if row.Raw == nil {
+		b.WriteString("No raw data for this item.\n")
+		return
+	}
+	writeValueTree(b, "", row.Raw, 0, width)
+}
+
+func traceCollectionTabs(active traceCollectionTab) string {
+	items := []traceCollectionTab{
+		traceCollectionOverview,
+		traceCollectionData,
+		traceCollectionRaw,
+	}
+
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		label := traceCollectionTabLabel(item)
+		if item == active {
+			label = "[" + label + "]"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func traceCollectionTabLabel(tab traceCollectionTab) string {
+	switch tab {
+	case traceCollectionData:
+		return "Data"
+	case traceCollectionRaw:
+		return "Raw"
+	default:
+		return "Overview"
+	}
+}
+
+func traceCollectionDetailMaxOffset(collection TraceCollectionVM, state traceWorkspaceState, width int, height int) int {
+	if width < 120 || len(collection.Rows) == 0 {
+		return 0
+	}
+	const gap = 3
+	leftWidth, rightWidth := traceEventSplitWidths(width, gap)
+	cursor := traceCollectionCursorForRows(state, collection.Rows)
+	left := renderTraceCollectionList(collection, cursor, leftWidth, state.CollectionPane == tracePaneTree)
+	right := renderTraceCollectionDetail(collection, collection.Rows[cursor], state.CollectionTab, rightWidth, state.CollectionPane == tracePaneDetail)
+	panelHeight := traceEventSplitPanelHeight(left, right, height)
+	return max(0, lipgloss.Height(right)-panelHeight)
+}
+
+func traceCollectionCursorForRows(state traceWorkspaceState, rows []TraceCollectionRowVM) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	return clamp(state.CollectionCursor, 0, len(rows)-1)
+}
+
+func collectionRowStyle(row TraceCollectionRowVM) lipgloss.Style {
+	switch row.Kind {
+	case "direction":
+		return traceDirectionStyle
+	case "action":
+		return traceActionStyle
+	case "question", "prompt", "prompt_block":
+		return traceThoughtStyle
+	case "memory":
+		return traceMemoryStyle
+	case "card":
+		return traceFixStyle
+	case "risk", "stop":
+		return traceErrorStyle
+	case "policy":
+		return traceDefaultStyle
+	default:
+		return traceDefaultStyle
+	}
+}
+
+func traceDirectionByID(trace problemtrace.ProblemTrace, id string) any {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	for _, direction := range trace.Directions {
+		if strings.TrimSpace(direction.ID) == id {
+			return direction
+		}
+	}
+	return nil
+}
+
+func traceMemoryPolicies() []string {
+	return []string{
+		"Memory is hypothesis input, not fact.",
+		"Cards remain draft until review.",
+		"Secrets and hidden reasoning are not exported.",
+	}
+}
+
+func tracePromptSummary(prompt problemtrace.PromptSnapshot) string {
+	return fmt.Sprintf("%s step=%d", prompt.ID, prompt.Step)
+}
+
+func isCompactPromptBlock(kind string) bool {
+	switch kind {
+	case "frontier", "memory_context", "recent_observations", "conversation_state":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -211,53 +743,668 @@ type indexedEvent struct {
 	Event core.Event
 }
 
-func renderTraceEvents(b *strings.Builder, events []core.Event, width int, debug bool) {
-	if len(events) == 0 {
-		b.WriteString("No events recorded.\n")
-		return
-	}
+type TraceEventRowVM struct {
+	Index   int
+	Type    string
+	Kind    string
+	Icon    string
+	Status  string
+	Title   string
+	Summary string
+	Tool    string
+	Code    int
+	Event   core.Event
+}
+
+func buildTraceEventRows(events []core.Event, debug bool) []TraceEventRowVM {
 	items := indexedEvents(events)
 	if !debug {
 		items = keyTraceEvents(events)
 	}
-	if len(items) == 0 {
-		b.WriteString("No key events recorded.\n")
+
+	rows := make([]TraceEventRowVM, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, projectTraceEvent(item))
+	}
+	return rows
+}
+
+func projectTraceEvent(item indexedEvent) TraceEventRowVM {
+	event := item.Event
+	row := TraceEventRowVM{
+		Index:  item.Index,
+		Type:   event.Type,
+		Kind:   "debug",
+		Icon:   ".",
+		Status: "debug",
+		Title:  event.Type,
+		Event:  event,
+	}
+
+	switch event.Type {
+	case "user_task":
+		row.Kind = "task"
+		row.Icon = "T"
+		row.Status = "start"
+		row.Title = "Task"
+		row.Summary = traceEventSummary(event.Data["task"], 100)
+	case "model_request":
+		row.Kind = "ai"
+		row.Icon = "A"
+		row.Status = "request"
+		row.Title = "AI request"
+		row.Summary = traceEventModelRequestSummary(event)
+	case "model_response":
+		row.Kind = "ai"
+		row.Icon = "A"
+		row.Status = "plan"
+		row.Title = "AI plan"
+		row.Summary = traceEventSummary(stripFencedBlocks(traceEventText(event.Data["content"])), 120)
+	case "tool_proposed":
+		row.Kind = "approval"
+		row.Icon = "?"
+		row.Status = "proposed"
+		row.Tool = traceEventText(event.Data["tool"])
+		row.Title = "Tool proposed"
+		row.Summary = valueOrDefault(row.Tool, "tool")
+	case "tool_call":
+		row.Kind = "action"
+		row.Icon = ">"
+		row.Status = "run"
+		row.Tool = traceEventText(event.Data["tool"])
+		row.Title = "Action"
+		row.Summary = traceEventActionSummary(row.Tool, commandFromArgs(event.Data["args"]))
+	case "tool_result":
+		row.Kind = "result"
+		row.Tool = traceEventText(event.Data["tool"])
+		row.Code = intValue(event.Data["code"])
+		if row.Code == 0 {
+			row.Icon = "+"
+			row.Status = "ok"
+			row.Title = "Result"
+		} else {
+			row.Icon = "x"
+			row.Status = "failed"
+			row.Title = "Result"
+		}
+		if timedOut, ok := normalizeValue(event.Data["timed_out"]).(bool); ok && timedOut {
+			row.Icon = "x"
+			row.Status = "timeout"
+			row.Title = "Result"
+		}
+		row.Summary = traceEventToolResultSummary(row)
+	case "tool_denied":
+		row.Kind = "approval"
+		row.Icon = "x"
+		row.Status = "denied"
+		row.Tool = traceEventText(event.Data["tool"])
+		row.Title = "Tool denied"
+		row.Summary = valueOrDefault(traceEventSummary(event.Data["reason"], 100), valueOrDefault(row.Tool, "tool"))
+	case "symptom_detected":
+		row.Kind = "symptom"
+		row.Icon = "!"
+		row.Status = "observed"
+		row.Title = "Symptom"
+		row.Summary = traceEventSummary(nestedSummary(event.Data["symptom"], "summary"), 120)
+	case "direction_created", "direction_updated":
+		row.Kind = "direction"
+		row.Icon = "D"
+		row.Status = "updated"
+		row.Title = "Direction"
+		row.Summary = traceEventSummary(displayDirectionTitle(
+			nestedSummary(event.Data["direction"], "id"),
+			nestedSummary(event.Data["direction"], "hypothesis"),
+		), 120)
+	case "evidence_added":
+		row.Kind = "evidence"
+		row.Icon = "E"
+		row.Status = "captured"
+		row.Title = "Evidence"
+		row.Summary = traceEventSummary(nestedSummary(event.Data["evidence"], "summary"), 120)
+	case "error":
+		row.Kind = "error"
+		row.Icon = "x"
+		row.Status = "error"
+		row.Title = "Error"
+		row.Summary = traceEventSummary(event.Data["error"], 120)
+	case "final":
+		row.Kind = "final"
+		row.Icon = "+"
+		row.Status = valueOrDefault(traceEventText(event.Data["status"]), "finished")
+		row.Title = "Final"
+		row.Summary = row.Status
+	case "problem_trace_initialized":
+		row.Kind = "task"
+		row.Icon = "T"
+		row.Status = "trace"
+		row.Title = "Trace started"
+		row.Summary = traceEventSummary(event.Data["trace_id"], 100)
+	case "trace_span_ended":
+		row.Kind = "debug"
+		row.Icon = "S"
+		row.Status = "span"
+		row.Title = "Trace span"
+		row.Summary = traceEventSpanSummary(event)
+	case "prompt_snapshot":
+		row.Kind = "ai"
+		row.Icon = "P"
+		row.Status = "prompt"
+		row.Title = "Prompt"
+		row.Summary = traceEventSnapshotSummary(event)
+	case "frontier_updated":
+		row.Kind = "direction"
+		row.Icon = "D"
+		row.Status = "frontier"
+		row.Title = "Frontier"
+		row.Summary = traceEventFrontierSummary(event)
+	case "memory_card_generated":
+		row.Kind = "evidence"
+		row.Icon = "M"
+		row.Status = "memory"
+		row.Title = "Memory card"
+		row.Summary = traceEventMemoryCardSummary(event)
+	default:
+		row.Summary = traceEventDefaultSummary(event)
+	}
+
+	if row.Summary == "" {
+		row.Summary = traceEventTraceSummary(event)
+	}
+	return row
+}
+
+func renderTraceEventsWorkspace(b *strings.Builder, events []core.Event, state traceWorkspaceState, width int, height int) {
+	rows := buildTraceEventRows(events, state.Debug)
+	if width < 120 {
+		renderTraceEventListOnly(b, rows, state.EventCursor, width, height)
 		return
 	}
-	for _, item := range items {
-		event := item.Event
-		line := fmt.Sprintf("#%d %s", item.Index+1, event.Type)
-		line = appendCompactEventSummary(line, event)
-		if debug {
-			if tc, ok := event.Data["trace_context"]; ok {
-				line += "  " + shortString(traceContextSummary(tc), 80)
-			} else if traceID := strings.TrimSpace(fmt.Sprint(event.Data["trace_id"])); traceID != "" && traceID != "<nil>" {
-				line += "  trace=" + traceID
-			}
+
+	const gap = 3
+	leftWidth, rightWidth := traceEventSplitWidths(width, gap)
+	cursor := traceEventCursorForRows(state, rows)
+	left := renderTraceEventList(rows, cursor, leftWidth, state.EventPane == tracePaneTree)
+
+	var right string
+	if len(rows) == 0 {
+		right = "Selected Event\n\nNo event selected.\n"
+	} else {
+		right = renderTraceEventDetail(rows[cursor], state.EventTab, rightWidth, state.EventPane == tracePaneDetail)
+	}
+
+	panelHeight := traceEventSplitPanelHeight(left, right, height)
+	left = fitEventListAroundCursor(left, panelHeight, cursor)
+	right = fitHeightOffset(right, panelHeight, state.EventOffset)
+	divider := mutedStyle.Width(1).Render("|")
+
+	b.WriteString(lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Render(left),
+		" ",
+		divider,
+		" ",
+		lipgloss.NewStyle().Width(rightWidth).Render(right),
+	))
+}
+
+func renderTraceEventListOnly(b *strings.Builder, rows []TraceEventRowVM, cursor int, width int, height int) {
+	cursor = traceEventCursorForRows(traceWorkspaceState{EventCursor: cursor}, rows)
+	content := renderTraceEventList(rows, cursor, width, true)
+	if height > 0 {
+		content = fitEventListAroundCursor(content, max(8, height-4), cursor)
+	}
+	b.WriteString(content)
+}
+
+func renderTraceEventList(rows []TraceEventRowVM, cursor int, width int, active bool) string {
+	var b strings.Builder
+	title := "Event Stream"
+	if active {
+		title += " [active]"
+	}
+	b.WriteString(title)
+	b.WriteByte('\n')
+	b.WriteString("j/k move  h/l focus  [/] detail  d debug\n\n")
+
+	if len(rows) == 0 {
+		b.WriteString("No key events recorded.\n")
+		return b.String()
+	}
+
+	cursor = clamp(cursor, 0, len(rows)-1)
+	for i, row := range rows {
+		prefix := "  "
+		if i == cursor {
+			prefix = "> "
 		}
-		b.WriteString(wrapText(line, width))
+
+		line := fmt.Sprintf(
+			"%s#%-3d %-2s %-11s %s",
+			prefix,
+			row.Index+1,
+			row.Icon,
+			truncateDisplay(row.Title, 11),
+			row.Summary,
+		)
+		line = truncateDisplay(line, width)
+
+		if i == cursor {
+			line = traceSelectedStyle.Width(width).Render(line)
+		} else {
+			line = eventRowStyle(row).Render(line)
+		}
+
+		b.WriteString(line)
 		b.WriteByte('\n')
-		if !debug {
-			continue
+	}
+
+	return b.String()
+}
+
+func renderTraceEventDetail(row TraceEventRowVM, tab traceEventTab, width int, active bool) string {
+	var b strings.Builder
+	title := "Selected Event"
+	if active {
+		title += " [active]"
+	}
+	b.WriteString(title)
+	b.WriteByte('\n')
+	b.WriteString(traceEventTabs(tab))
+	b.WriteString("\n\n")
+
+	switch tab {
+	case traceEventData:
+		renderTraceEventData(&b, row, width)
+	case traceEventTrace:
+		renderTraceEventTrace(&b, row, width)
+	case traceEventRaw:
+		renderTraceEventRaw(&b, row, width)
+	default:
+		renderTraceEventOverview(&b, row, width)
+	}
+
+	return b.String()
+}
+
+func renderTraceEventOverview(b *strings.Builder, row TraceEventRowVM, width int) {
+	writeField(b, "Event", fmt.Sprintf("#%d %s", row.Index+1, row.Type), width)
+	if !row.Event.Time.IsZero() {
+		writeField(b, "Time", row.Event.Time.Format("2006-01-02 15:04:05"), width)
+	}
+	writeField(b, "Kind", row.Kind, width)
+	writeField(b, "Status", row.Status, width)
+	writeField(b, "Title", row.Title, width)
+	writeField(b, "Summary", row.Summary, width)
+
+	switch row.Type {
+	case "user_task":
+		writeField(b, "Task", row.Event.Data["task"], width)
+		writeField(b, "Repository", row.Event.Data["repo"], width)
+	case "model_request":
+		writeField(b, "Step", row.Event.Data["step"], width)
+		writeField(b, "Prompt", row.Event.Data["prompt_snapshot_id"], width)
+	case "model_response":
+		writeField(b, "AI said", stripFencedBlocks(traceEventText(row.Event.Data["content"])), width)
+	case "tool_proposed":
+		writeField(b, "Tool", row.Event.Data["tool"], width)
+		writeField(b, "Risk", row.Event.Data["risk"], width)
+	case "tool_call":
+		writeField(b, "Tool", row.Event.Data["tool"], width)
+		writeField(b, "Command", commandFromArgs(row.Event.Data["args"]), width)
+	case "tool_result":
+		writeField(b, "Tool", row.Event.Data["tool"], width)
+		writeField(b, "Code", row.Event.Data["code"], width)
+		writeField(b, "Timed Out", row.Event.Data["timed_out"], width)
+		writeField(b, "Output", eventOutput(row.Event.Data), width)
+	case "tool_denied":
+		writeField(b, "Tool", row.Event.Data["tool"], width)
+		writeField(b, "Reason", row.Event.Data["reason"], width)
+	case "symptom_detected":
+		writeField(b, "Symptom", nestedSummary(row.Event.Data["symptom"], "summary"), width)
+	case "direction_created", "direction_updated":
+		writeField(b, "Direction", displayDirectionTitle(
+			nestedSummary(row.Event.Data["direction"], "id"),
+			nestedSummary(row.Event.Data["direction"], "hypothesis"),
+		), width)
+	case "evidence_added":
+		writeField(b, "Evidence", nestedSummary(row.Event.Data["evidence"], "summary"), width)
+	case "error":
+		writeField(b, "Error", row.Event.Data["error"], width)
+	case "final":
+		writeField(b, "Steps", row.Event.Data["steps"], width)
+		writeField(b, "Submission", row.Event.Data["submission"], width)
+	}
+}
+
+func renderTraceEventData(b *strings.Builder, row TraceEventRowVM, width int) {
+	if len(row.Event.Data) == 0 {
+		b.WriteString("No structured data for this event.\n")
+		return
+	}
+	writeValueTree(b, "", row.Event.Data, 0, width)
+}
+
+func renderTraceEventTrace(b *strings.Builder, row TraceEventRowVM, width int) {
+	var tc problemtrace.TraceContext
+	if problemtraceDecode(row.Event.Data["trace_context"], &tc) {
+		writeSection(b, "Trace Context")
+		writeField(b, "Trace ID", tc.TraceID, width)
+		writeField(b, "Span ID", tc.SpanID, width)
+		writeField(b, "Parent Span", tc.ParentSpanID, width)
+		writeField(b, "Direction", tc.DirectionID, width)
+		writeField(b, "Prompt", tc.PromptSnapshotID, width)
+		if len(tc.MemoryIDs) > 0 {
+			writeField(b, "Memories", strings.Join(tc.MemoryIDs, ", "), width)
 		}
-		switch event.Type {
-		case "tool_proposed":
-			writeField(b, "Tool", event.Data["tool"], width)
-			writeField(b, "Risk", event.Data["risk"], width)
-		case "tool_call":
-			writeField(b, "Tool", event.Data["tool"], width)
-		case "tool_result":
-			writeField(b, "Tool", event.Data["tool"], width)
-			writeField(b, "Code", event.Data["code"], width)
-		case "model_request":
-			writeField(b, "Step", event.Data["step"], width)
-			writeField(b, "Prompt", event.Data["prompt_snapshot_id"], width)
-		case "symptom_detected":
-			writeField(b, "Symptom", nestedSummary(event.Data["symptom"], "summary"), width)
-		case "direction_created":
-			writeField(b, "Direction", displayDirectionTitle(nestedSummary(event.Data["direction"], "id"), nestedSummary(event.Data["direction"], "hypothesis")), width)
+		if tc.Flags.Recording || tc.Flags.Sampled {
+			writeField(b, "Recording", tc.Flags.Recording, width)
+			writeField(b, "Sampled", tc.Flags.Sampled, width)
+		}
+		return
+	}
+	if traceID := traceEventText(row.Event.Data["trace_id"]); traceID != "" {
+		writeSection(b, "Trace Context")
+		writeField(b, "Trace ID", traceID, width)
+		return
+	}
+	b.WriteString("No trace context linked to this event.\n")
+}
+
+func renderTraceEventRaw(b *strings.Builder, row TraceEventRowVM, width int) {
+	raw := map[string]any{
+		"index": row.Index + 1,
+		"type":  row.Type,
+	}
+	if !row.Event.Time.IsZero() {
+		raw["time"] = row.Event.Time.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if len(row.Event.Data) > 0 {
+		raw["data"] = row.Event.Data
+	}
+	writeValueTree(b, "", raw, 0, width)
+}
+
+func traceEventTabs(active traceEventTab) string {
+	items := []traceEventTab{
+		traceEventOverview,
+		traceEventData,
+		traceEventTrace,
+		traceEventRaw,
+	}
+
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		label := traceEventTabLabel(item)
+		if item == active {
+			label = "[" + label + "]"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func traceEventTabLabel(tab traceEventTab) string {
+	switch tab {
+	case traceEventData:
+		return "Data"
+	case traceEventTrace:
+		return "Trace"
+	case traceEventRaw:
+		return "Raw"
+	default:
+		return "Overview"
+	}
+}
+
+func traceEventSplitWidths(width int, gap int) (int, int) {
+	leftWidth := max(52, width*55/100)
+	rightWidth := max(40, width-leftWidth-gap)
+	if leftWidth+gap+rightWidth > width {
+		leftWidth = max(40, width-gap-rightWidth)
+	}
+	return leftWidth, rightWidth
+}
+
+func traceEventSplitPanelHeight(left string, right string, height int) int {
+	panelHeight := max(lipgloss.Height(left), lipgloss.Height(right))
+	if height > 0 {
+		panelHeight = min(panelHeight, max(8, height-4))
+	}
+	return panelHeight
+}
+
+func traceEventDetailMaxOffset(events []core.Event, state traceWorkspaceState, width int, height int) int {
+	if width < 120 {
+		return 0
+	}
+	rows := buildTraceEventRows(events, state.Debug)
+	if len(rows) == 0 {
+		return 0
+	}
+	const gap = 3
+	leftWidth, rightWidth := traceEventSplitWidths(width, gap)
+	cursor := traceEventCursorForRows(state, rows)
+	left := renderTraceEventList(rows, cursor, leftWidth, state.EventPane == tracePaneTree)
+	right := renderTraceEventDetail(rows[cursor], state.EventTab, rightWidth, state.EventPane == tracePaneDetail)
+	panelHeight := traceEventSplitPanelHeight(left, right, height)
+	return max(0, lipgloss.Height(right)-panelHeight)
+}
+
+func traceEventCursorForRows(state traceWorkspaceState, rows []TraceEventRowVM) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	return clamp(state.EventCursor, 0, len(rows)-1)
+}
+
+func fitEventListAroundCursor(content string, height int, cursor int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) <= height {
+		return fitHeight(content, height)
+	}
+
+	headerLines := min(3, len(lines))
+	bodyHeight := height - headerLines
+	if bodyHeight <= 0 {
+		return fitHeight(content, height)
+	}
+
+	body := lines[headerLines:]
+	if len(body) <= bodyHeight {
+		return fitHeight(content, height)
+	}
+
+	bodyCursor := clamp(cursor, 0, len(body)-1)
+	start := clamp(bodyCursor-bodyHeight/2, 0, max(0, len(body)-bodyHeight))
+	out := append([]string{}, lines[:headerLines]...)
+	out = append(out, body[start:min(len(body), start+bodyHeight)]...)
+	for len(out) < height {
+		out = append(out, "")
+	}
+	return strings.Join(out, "\n")
+}
+
+func eventRowStyle(row TraceEventRowVM) lipgloss.Style {
+	switch row.Kind {
+	case "task":
+		return traceProblemStyle
+	case "ai":
+		return traceThoughtStyle
+	case "action":
+		return traceActionStyle
+	case "result":
+		if row.Status == "failed" || row.Status == "error" || row.Status == "timeout" {
+			return traceErrorStyle
+		}
+		return traceObserveStyle
+	case "symptom":
+		return traceErrorStyle
+	case "direction":
+		return traceDirectionStyle
+	case "evidence":
+		return traceEvidenceStyle
+	case "final":
+		return traceFixStyle
+	default:
+		return traceDefaultStyle
+	}
+}
+
+func traceEventSummary(value any, limit int) string {
+	text := shortString(value, limit)
+	if text == "<nil>" {
+		return ""
+	}
+	return text
+}
+
+func traceEventText(value any) string {
+	text := strings.TrimSpace(formatScalar(normalizeValue(value)))
+	if text == "<nil>" {
+		return ""
+	}
+	return text
+}
+
+func traceEventActionSummary(tool string, command string) string {
+	if command != "" {
+		return traceEventSummary(command, 120)
+	}
+	return valueOrDefault(tool, "tool")
+}
+
+func traceEventToolResultSummary(row TraceEventRowVM) string {
+	tool := valueOrDefault(row.Tool, "tool")
+	if row.Event.Data["code"] == nil {
+		if row.Status == "timeout" {
+			return tool + " timeout"
+		}
+		return tool
+	}
+	summary := fmt.Sprintf("%s code=%d", tool, row.Code)
+	if row.Status == "timeout" {
+		summary += " timeout"
+	}
+	return summary
+}
+
+func traceEventModelRequestSummary(event core.Event) string {
+	parts := []string{}
+	if step := traceEventText(event.Data["step"]); step != "" {
+		parts = append(parts, "step="+step)
+	}
+	if promptID := traceEventText(event.Data["prompt_snapshot_id"]); promptID != "" {
+		parts = append(parts, "prompt="+promptID)
+	}
+	if len(parts) == 0 {
+		return traceEventSummary(event.Data["model"], 100)
+	}
+	return strings.Join(parts, " ")
+}
+
+func traceEventSpanSummary(event core.Event) string {
+	span, ok := normalizeValue(event.Data["span"]).(map[string]any)
+	if !ok {
+		return traceEventTraceSummary(event)
+	}
+	parts := []string{}
+	for _, key := range []string{"name", "kind", "status", "span_id"} {
+		if value := traceEventText(span[key]); value != "" {
+			parts = append(parts, value)
 		}
 	}
+	return traceEventSummary(strings.Join(parts, " "), 120)
+}
+
+func traceEventSnapshotSummary(event core.Event) string {
+	snapshot, ok := normalizeValue(event.Data["snapshot"]).(map[string]any)
+	if !ok {
+		return traceEventTraceSummary(event)
+	}
+	parts := []string{}
+	if id := traceEventText(snapshot["id"]); id != "" {
+		parts = append(parts, id)
+	}
+	if step := traceEventText(snapshot["step"]); step != "" {
+		parts = append(parts, "step="+step)
+	}
+	if tokens := traceEventText(snapshot["token_estimate"]); tokens != "" {
+		parts = append(parts, "tokens="+tokens)
+	}
+	return traceEventSummary(strings.Join(parts, " "), 120)
+}
+
+func traceEventFrontierSummary(event core.Event) string {
+	frontier, ok := normalizeValue(event.Data["frontier"]).(map[string]any)
+	if !ok {
+		return traceEventTraceSummary(event)
+	}
+	if active := traceEventText(frontier["active_direction_id"]); active != "" {
+		return traceEventSummary("active "+active, 120)
+	}
+	return traceEventTraceSummary(event)
+}
+
+func traceEventMemoryCardSummary(event core.Event) string {
+	card, ok := normalizeValue(event.Data["card"]).(map[string]any)
+	if !ok {
+		return traceEventTraceSummary(event)
+	}
+	return traceEventSummary(card["summary"], 120)
+}
+
+func traceEventTraceSummary(event core.Event) string {
+	if summary := traceContextSummary(event.Data["trace_context"]); summary != "" {
+		return traceEventSummary(summary, 120)
+	}
+	if traceID := traceEventText(event.Data["trace_id"]); traceID != "" {
+		return traceEventSummary("trace="+traceID, 120)
+	}
+	return ""
+}
+
+func traceEventDefaultSummary(event core.Event) string {
+	if summary := traceEventTraceSummary(event); summary != "" {
+		return summary
+	}
+	if len(event.Data) == 0 {
+		return ""
+	}
+	return traceEventSummary(formatArgsMap(event.Data), 120)
+}
+
+func truncateDisplay(s string, width int) string {
+	s = formatDisplayText(s)
+	if width <= 0 {
+		return ""
+	}
+	if displayWidth(s) <= width {
+		return s
+	}
+	if width <= 3 {
+		var b strings.Builder
+		for _, r := range s {
+			if displayWidth(b.String()+string(r)) > width {
+				break
+			}
+			b.WriteRune(r)
+		}
+		return b.String()
+	}
+
+	target := width - 3
+	var b strings.Builder
+	for _, r := range s {
+		next := b.String() + string(r)
+		if displayWidth(next) > target {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimRight(b.String(), " ") + "..."
 }
 
 func indexedEvents(events []core.Event) []indexedEvent {
@@ -290,128 +1437,6 @@ func keyTraceEvents(events []core.Event) []indexedEvent {
 		}
 	}
 	return out
-}
-
-func appendCompactEventSummary(line string, event core.Event) string {
-	switch event.Type {
-	case "user_task":
-		return line + compactSuffix(event.Data["task"])
-	case "model_response":
-		return line + compactSuffix(event.Data["content"])
-	case "tool_proposed":
-		return line + compactSuffix(event.Data["tool"])
-	case "tool_call":
-		return line + compactSuffix(event.Data["tool"])
-	case "tool_result":
-		out := line + compactSuffix(event.Data["tool"])
-		if code := intValue(event.Data["code"]); code != 0 || event.Data["code"] != nil {
-			out += fmt.Sprintf(" code=%d", code)
-		}
-		return out
-	case "tool_denied":
-		return line + compactSuffix(event.Data["tool"])
-	case "symptom_detected":
-		return line + compactSuffix(nestedSummary(event.Data["symptom"], "summary"))
-	case "direction_created", "direction_updated":
-		return line + compactSuffix(displayDirectionTitle(nestedSummary(event.Data["direction"], "id"), nestedSummary(event.Data["direction"], "hypothesis")))
-	case "evidence_added":
-		return line + compactSuffix(nestedSummary(event.Data["evidence"], "summary"))
-	case "error":
-		return line + compactSuffix(event.Data["error"])
-	case "final":
-		return line + compactSuffix(event.Data["status"])
-	default:
-		return line
-	}
-}
-
-func compactSuffix(value any) string {
-	text := shortString(value, 120)
-	if text == "" || text == "<nil>" {
-		return ""
-	}
-	return " " + text
-}
-
-func renderTracePrompts(b *strings.Builder, trace problemtrace.ProblemTrace, width int, debug bool) {
-	if len(trace.Prompts) == 0 {
-		b.WriteString("No prompt snapshots recorded.\n")
-		return
-	}
-	if !debug {
-		prompt := trace.Prompts[len(trace.Prompts)-1]
-		writeSection(b, fmt.Sprintf("Latest Prompt: %s step=%d", prompt.ID, prompt.Step))
-		writeField(b, "Tokens", prompt.TokenEstimate, width)
-		writeField(b, "Messages", prompt.MessageCount, width)
-		writeField(b, "Tools", prompt.ToolCount, width)
-
-		writeSection(b, "Context")
-		for _, block := range prompt.Blocks {
-			switch block.Kind {
-			case "frontier", "memory_context", "recent_observations", "conversation_state":
-				status := "no"
-				if block.Included {
-					status = "yes"
-				}
-				line := fmt.Sprintf("- %s: %s", valueOrDefault(block.Title, block.Kind), status)
-				if block.Count > 0 {
-					line += fmt.Sprintf(" count=%d", block.Count)
-				}
-				b.WriteString(wrapText(line, width))
-				b.WriteByte('\n')
-			}
-		}
-		return
-	}
-	for _, prompt := range trace.Prompts {
-		writeSection(b, fmt.Sprintf("%s step=%d", prompt.ID, prompt.Step))
-		writeField(b, "Model", prompt.Model, width)
-		writeField(b, "Messages", prompt.MessageCount, width)
-		writeField(b, "Tools", prompt.ToolCount, width)
-		writeField(b, "Token Estimate", prompt.TokenEstimate, width)
-		for _, block := range prompt.Blocks {
-			status := "no"
-			if block.Included {
-				status = "yes"
-			}
-			line := fmt.Sprintf("- %s included=%s count=%d", valueOrDefault(block.Title, block.Kind), status, block.Count)
-			b.WriteString(wrapText(line, width))
-			b.WriteByte('\n')
-			if block.Summary != "" {
-				b.WriteString(indentText(wrapText(block.Summary, remainingWidth(width, 2)), 2))
-				b.WriteByte('\n')
-			}
-		}
-	}
-}
-
-func renderTraceCards(b *strings.Builder, trace problemtrace.ProblemTrace, width int, debug bool) {
-	if len(trace.Cards) == 0 {
-		b.WriteString("No draft memory cards yet. Cards are generated when the run finishes.\n")
-		return
-	}
-	writeSection(b, "Draft Memory Cards")
-	for _, card := range trace.Cards {
-		header := fmt.Sprintf("[%s %s]", valueOrDefault(card.Kind, "card"), valueOrDefault(card.Status, "draft"))
-		if debug && card.ID != "" {
-			header += " " + card.ID
-		}
-		writeSection(b, header)
-		if card.Summary != "" {
-			b.WriteString(wrapText(card.Summary, width))
-			b.WriteByte('\n')
-		}
-		if card.FixPattern != "" {
-			writeField(b, "fix", card.FixPattern, width)
-		}
-		if card.Verification != "" {
-			writeField(b, "verification", card.Verification, width)
-		}
-		for _, evidence := range card.Evidence {
-			b.WriteString(indentText(wrapText("evidence: "+evidence, remainingWidth(width, 2)), 2))
-			b.WriteByte('\n')
-		}
-	}
 }
 
 func activeDirectionSummary(trace problemtrace.ProblemTrace) string {
@@ -455,18 +1480,6 @@ func isGenericObservationDirection(id, title string) bool {
 	return id == "node-dir-collect-current-repository-evidence" ||
 		id == "dir-collect-current-repository-evidence" ||
 		title == "collect current repository evidence"
-}
-
-func renderStringList(b *strings.Builder, title string, values []string, width int) {
-	writeSection(b, title)
-	if len(values) == 0 {
-		b.WriteString("none\n")
-		return
-	}
-	for _, value := range values {
-		b.WriteString(wrapText("- "+value, width))
-		b.WriteByte('\n')
-	}
 }
 
 func traceContextSummary(value any) string {
