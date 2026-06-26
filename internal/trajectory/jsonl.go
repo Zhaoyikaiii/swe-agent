@@ -52,13 +52,18 @@ func (s *JSONLStore) Append(ctx context.Context, event core.Event) error {
 }
 
 func (s *JSONLStore) Load(ctx context.Context) ([]core.Event, error) {
-	file, err := os.Open(s.path)
+	return LoadFile(ctx, s.path)
+}
+
+func LoadFile(ctx context.Context, path string) ([]core.Event, error) {
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 	var events []core.Event
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():

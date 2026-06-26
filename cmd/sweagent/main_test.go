@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/local/swe-agent/internal/problemtrace"
+	"github.com/local/swe-agent/internal/trajectory"
 )
 
 func TestRunCommandMockSubmit(t *testing.T) {
@@ -96,4 +102,72 @@ func TestBuildAgentCodexCLIProviderDoesNotInheritMockModel(t *testing.T) {
 	if ag.Config.Model.Model != "" {
 		t.Fatalf("expected codex-cli default model to be empty, got %q", ag.Config.Model.Model)
 	}
+}
+
+func TestPreviewFixtureWritesLoadableTrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace-preview.jsonl")
+	if err := run([]string{"preview-fixture", "--output", path}); err != nil {
+		t.Fatalf("preview-fixture returned error: %v", err)
+	}
+
+	events, err := trajectory.LoadFile(context.Background(), path)
+	if err != nil {
+		t.Fatalf("load preview fixture: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected preview fixture events")
+	}
+	trace := problemtrace.Replay(events)
+	if trace.TraceID != "trace-preview" {
+		t.Fatalf("expected trace-preview id, got %q", trace.TraceID)
+	}
+	if len(trace.Directions) == 0 {
+		t.Fatalf("expected fixture directions, got %#v", trace)
+	}
+}
+
+func TestPreviewCommandRenderLoadsTrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace-preview.jsonl")
+	if err := run([]string{"preview-fixture", "--output", path}); err != nil {
+		t.Fatalf("preview-fixture returned error: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := run([]string{"preview", "--trace", path, "--render", "--width", "140", "--height", "24"}); err != nil {
+			t.Fatalf("preview --render returned error: %v", err)
+		}
+	})
+	for _, want := range []string{
+		"Problem Trace Workspace",
+		"Trace Tree [active]",
+		"Selected Detail",
+		"Fix unresolved PR review comments",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected preview render to contain %q, got:\n%s", want, output)
+		}
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	readFile, writeFile, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	os.Stdout = writeFile
+	defer func() {
+		os.Stdout = old
+	}()
+
+	fn()
+	if err := writeFile.Close(); err != nil {
+		t.Fatalf("close stdout pipe: %v", err)
+	}
+	data, err := io.ReadAll(readFile)
+	if err != nil {
+		t.Fatalf("read stdout pipe: %v", err)
+	}
+	return string(data)
 }

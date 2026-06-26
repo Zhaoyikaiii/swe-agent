@@ -40,6 +40,10 @@ func run(args []string) error {
 		return runCommand(args[1:])
 	case "tui":
 		return tuiCommand(args[1:])
+	case "preview":
+		return previewCommand(args[1:])
+	case "preview-fixture":
+		return previewFixtureCommand(args[1:])
 	case "tools":
 		return toolsCommand(args[1:])
 	case "config":
@@ -309,12 +313,18 @@ func printUsage() {
   sweagent tui [--repo .]
   sweagent run --task "fix the failing test" --repo . [--auto-approve]
   sweagent run --task "fix the failing test" --repo . --tui
+  sweagent preview-fixture --output trace-preview.jsonl
+  sweagent preview --trace trace-preview.jsonl
+  sweagent preview --trace trace-preview.jsonl --render --width 140
   sweagent tools
   sweagent config
 
 Commands:
   tui      open the interactive terminal UI
   run      execute one SWE-agent task
+  preview  load a trajectory JSONL into the Trace workspace
+  preview-fixture
+           write a sample Trace workspace JSONL fixture
   tools    list enabled tools
   config   print merged configuration`)
 }

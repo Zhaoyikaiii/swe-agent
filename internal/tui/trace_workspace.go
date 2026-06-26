@@ -11,6 +11,10 @@ import (
 )
 
 func traceWorkspaceViewWidth(record taskRecord, state traceWorkspaceState, width int, trajectoryPath string) string {
+	return traceWorkspaceView(record, state, width, 0, trajectoryPath)
+}
+
+func traceWorkspaceView(record taskRecord, state traceWorkspaceState, width int, height int, trajectoryPath string) string {
 	state.ensureDefaults()
 	vm := buildTraceWorkspaceVM(record, state, trajectoryPath)
 	var b strings.Builder
@@ -29,7 +33,7 @@ func traceWorkspaceViewWidth(record taskRecord, state traceWorkspaceState, width
 	case traceTabCards:
 		renderTraceCards(&b, vm.Trace, width, state.Debug)
 	default:
-		renderTraceTreeTab(&b, vm, state, width, record)
+		renderTraceTreeTab(&b, vm, state, width, height, record)
 	}
 	return b.String()
 }
@@ -61,6 +65,19 @@ func traceTabLabel(tab traceTab) string {
 		return "Learn"
 	default:
 		return "Trace"
+	}
+}
+
+func traceDetailTabLabel(tab traceDetailTab) string {
+	switch tab {
+	case traceDetailOutput:
+		return "Output"
+	case traceDetailEvents:
+		return "Events"
+	case traceDetailDebug:
+		return "Debug"
+	default:
+		return "Overview"
 	}
 }
 
@@ -224,6 +241,9 @@ func renderTraceEvents(b *strings.Builder, events []core.Event, width int, debug
 			continue
 		}
 		switch event.Type {
+		case "tool_proposed":
+			writeField(b, "Tool", event.Data["tool"], width)
+			writeField(b, "Risk", event.Data["risk"], width)
 		case "tool_call":
 			writeField(b, "Tool", event.Data["tool"], width)
 		case "tool_result":
@@ -252,6 +272,7 @@ func keyTraceEvents(events []core.Event) []indexedEvent {
 	keep := map[string]bool{
 		"user_task":         true,
 		"model_response":    true,
+		"tool_proposed":     true,
 		"tool_call":         true,
 		"tool_result":       true,
 		"tool_denied":       true,
@@ -277,6 +298,8 @@ func appendCompactEventSummary(line string, event core.Event) string {
 		return line + compactSuffix(event.Data["task"])
 	case "model_response":
 		return line + compactSuffix(event.Data["content"])
+	case "tool_proposed":
+		return line + compactSuffix(event.Data["tool"])
 	case "tool_call":
 		return line + compactSuffix(event.Data["tool"])
 	case "tool_result":

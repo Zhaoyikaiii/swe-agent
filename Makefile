@@ -13,8 +13,9 @@ REPO ?= .
 TASK ?= finish immediately
 ARGS ?=
 SMOKE_ARGS ?=
+TRACE_PREVIEW ?= trajectories/trace-preview.jsonl
 
-.PHONY: help fmt vet test test-race tidy check build smoke run run-json tools config clean
+.PHONY: help fmt vet test test-race tidy check build smoke run run-json preview tools config clean
 
 help: ## Show available make targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -48,6 +49,10 @@ run: ## Run a mock SWE-agent task. Override TASK, REPO, CONFIG, and ARGS as need
 
 run-json: ## Run a mock SWE-agent task and print JSON.
 	$(GO) run $(CMD) run --config $(CONFIG) --task "$(TASK)" --repo $(REPO) --json $(ARGS)
+
+preview: ## Generate a sample Trace JSONL and open the interactive Trace TUI.
+	$(GO) run $(CMD) preview-fixture --output $(TRACE_PREVIEW)
+	$(GO) run $(CMD) preview --trace $(TRACE_PREVIEW)
 
 tools: ## List enabled tools.
 	$(GO) run $(CMD) tools --config $(CONFIG)

@@ -219,7 +219,7 @@ func flattenTraceTree(vm TraceTreeVM, expanded map[string]bool) []TraceTreeRow {
 	return rows
 }
 
-func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWorkspaceState, width int, record taskRecord) {
+func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int, record taskRecord) {
 	trace := vm.Trace
 	snapshot := BuildRunSnapshot(record, vm.TrajectoryPath)
 	writeField(b, "Task", shortString(trace.Problem.UserTask, 120), width)
@@ -242,6 +242,11 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 	}
 
 	b.WriteByte('\n')
+	if width >= 120 {
+		b.WriteString(renderTraceSplit(vm, state, width, height))
+		return
+	}
+
 	b.WriteString(renderTraceTreeASCII(vm.Rows, state, width))
 
 	if vm.Selected != nil && len(vm.Rows) > 0 {
@@ -255,9 +260,22 @@ func renderTraceTreeTab(b *strings.Builder, vm TraceWorkspaceVM, state traceWork
 }
 
 func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width int) string {
+	return renderTraceTreeASCIIOptions(rows, state, width, true)
+}
+
+func renderTraceTreeASCIIOptions(rows []TraceTreeRow, state traceWorkspaceState, width int, inlineSummary bool) string {
 	var b strings.Builder
-	b.WriteString("Trace Tree\n")
-	b.WriteString("j/k move  enter expand/collapse  o inspect  tab switch tab\n\n")
+	title := "Trace Tree"
+	if !inlineSummary && state.Pane == tracePaneTree {
+		title += " [active]"
+	}
+	b.WriteString(title)
+	b.WriteByte('\n')
+	if inlineSummary {
+		b.WriteString("j/k move  enter expand/collapse  o inspect  tab switch tab\n\n")
+	} else {
+		b.WriteString("j/k move  enter expand/collapse  h/l focus  o output\n\n")
+	}
 
 	if len(rows) == 0 {
 		b.WriteString("No trace tree nodes yet.\n")
@@ -280,13 +298,7 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 			}
 		}
 
-		line := fmt.Sprintf("%s%s%s%s %s %s", selection, row.Prefix, row.Connector, twisty, traceStatusASCII(row.Status), displayTraceRowTitle(row))
-		if kind := displayTraceKindLabel(row.Kind, row.NodeID, row.Title); kind != "" {
-			line += "  " + kind
-		}
-		if row.Status != "" {
-			line += "  " + row.Status
-		}
+		line := formatTraceTreeLine(row, selection, twisty, width)
 		line = truncate(line, width)
 		if i == cursor {
 			line = traceSelectedStyle.Width(width).Render(line)
@@ -296,12 +308,277 @@ func renderTraceTreeASCII(rows []TraceTreeRow, state traceWorkspaceState, width 
 		b.WriteString(line)
 		b.WriteByte('\n')
 
-		if i == cursor && strings.TrimSpace(row.Summary) != "" {
+		if inlineSummary && i == cursor && strings.TrimSpace(row.Summary) != "" {
 			b.WriteString(indentText(wrapText(row.Summary, remainingWidth(width, 4)), 4))
 			b.WriteByte('\n')
 		}
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+func formatTraceTreeLine(row TraceTreeRow, selection string, twisty string, width int) string {
+	prefix := fmt.Sprintf("%s%s%s%s %s ", selection, row.Prefix, row.Connector, twisty, traceStatusASCII(row.Status))
+	title := displayTraceRowTitle(row)
+	suffix := ""
+	if kind := displayTraceKindLabel(row.Kind, row.NodeID, row.Title); kind != "" {
+		suffix += "  " + kind
+	}
+	if row.Status != "" {
+		suffix += "  " + row.Status
+	}
+	if width > 0 && suffix != "" {
+		titleWidth := width - displayWidth(prefix) - displayWidth(suffix)
+		if titleWidth >= 4 {
+			title = truncate(title, titleWidth)
+		}
+	}
+	return prefix + title + suffix
+}
+
+func renderTraceSplit(vm TraceWorkspaceVM, state traceWorkspaceState, width int, height int) string {
+	gap := 2
+	leftWidth := max(48, width*58/100)
+	rightWidth := max(36, width-leftWidth-gap)
+	if leftWidth+gap+rightWidth > width {
+		leftWidth = max(36, width-gap-rightWidth)
+	}
+
+	left := renderTraceTreePanel(vm, state, leftWidth)
+	right := renderTraceDetailPanel(vm, state, rightWidth)
+
+	leftHeight := lipgloss.Height(left)
+	rightHeight := lipgloss.Height(right)
+	panelHeight := max(leftHeight, rightHeight)
+	if height > 0 {
+		panelHeight = min(panelHeight, max(8, height-8))
+	}
+
+	left = fitHeight(left, panelHeight)
+	right = fitHeightOffset(right, panelHeight, state.DetailOffset)
+
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Render(left),
+		strings.Repeat(" ", gap),
+		lipgloss.NewStyle().Width(rightWidth).Render(right),
+	)
+}
+
+func fitHeightOffset(content string, height int, offset int) string {
+	if height <= 0 {
+		return strings.TrimRight(content, "\n")
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	maxOffset := max(0, len(lines)-height)
+	offset = clamp(offset, 0, maxOffset)
+	end := min(len(lines), offset+height)
+	lines = append([]string(nil), lines[offset:end]...)
+	if offset > 0 && len(lines) > 0 {
+		lines[0] = "..."
+	}
+	if offset < maxOffset && len(lines) > 0 {
+		lines[len(lines)-1] = "..."
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderTraceTreePanel(vm TraceWorkspaceVM, state traceWorkspaceState, width int) string {
+	return renderTraceTreeASCIIOptions(vm.Rows, state, width, false)
+}
+
+func renderTraceDetailPanel(vm TraceWorkspaceVM, state traceWorkspaceState, width int) string {
+	var b strings.Builder
+	title := "Selected Detail"
+	if state.Pane == tracePaneDetail {
+		title += " [active]"
+	}
+	b.WriteString(title)
+	b.WriteByte('\n')
+	b.WriteString(traceDetailTabs(state.DetailTab))
+	b.WriteString("\n\n")
+
+	row, node, ok := selectedTraceNode(vm, state)
+	if !ok {
+		b.WriteString("No node selected.\n")
+		return b.String()
+	}
+
+	switch state.DetailTab {
+	case traceDetailOutput:
+		renderTraceDetailOutput(&b, row, node, vm, width)
+	case traceDetailEvents:
+		renderTraceDetailEvents(&b, row, node, width)
+	case traceDetailDebug:
+		renderTraceDetailDebug(&b, row, node, width)
+	default:
+		renderTraceDetailOverview(&b, row, node, vm, width)
+	}
+
+	return b.String()
+}
+
+func traceDetailTabs(active traceDetailTab) string {
+	items := []traceDetailTab{
+		traceDetailOverview,
+		traceDetailOutput,
+		traceDetailEvents,
+		traceDetailDebug,
+	}
+
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		label := traceDetailTabLabel(item)
+		if item == active {
+			label = "[" + label + "]"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func selectedTraceNode(vm TraceWorkspaceVM, state traceWorkspaceState) (TraceTreeRow, TraceTreeNodeVM, bool) {
+	if len(vm.Rows) == 0 {
+		return TraceTreeRow{}, TraceTreeNodeVM{}, false
+	}
+	cursor := traceCursorForRows(state, vm.Rows)
+	row := vm.Rows[cursor]
+	node, ok := vm.Tree.Nodes[row.NodeID]
+	return row, node, ok
+}
+
+func renderTraceDetailOverview(b *strings.Builder, row TraceTreeRow, node TraceTreeNodeVM, vm TraceWorkspaceVM, width int) {
+	switch strings.ToLower(strings.TrimSpace(node.Kind)) {
+	case "thought":
+		writeField(b, "AI said", node.Summary, width)
+	case "action":
+		writeField(b, "Action", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		if node.Summary != "" {
+			writeField(b, "Why", node.Summary, width)
+		}
+		if child := firstChildOfKind(vm, node.ID, "observation"); child != nil {
+			writeField(b, "Latest result", displayTraceNodeTitle(*child), width)
+		}
+	case "observation":
+		writeField(b, "Observation", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		writeField(b, "Summary", summarizeObservationForOverview(node.Summary), width)
+	case "direction":
+		writeField(b, "Direction", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		writeField(b, "Why", node.Summary, width)
+	case "evidence":
+		writeField(b, "Evidence", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		writeField(b, "Detail", node.Summary, width)
+	case "symptom":
+		writeField(b, "Symptom", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		writeField(b, "Evidence", node.Summary, width)
+	case "prompt":
+		writeField(b, "Prompt", displayTraceNodeTitle(node), width)
+	case "task", "problem":
+		writeField(b, "What", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		writeField(b, "Why", node.Summary, width)
+	case "fix", "verification":
+		writeField(b, "Item", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		if node.Summary != "" {
+			writeField(b, "Why", node.Summary, width)
+		}
+	default:
+		writeField(b, "Item", displayTraceNodeTitle(node), width)
+		writeField(b, "Status", node.Status, width)
+		if node.Summary != "" {
+			writeField(b, "Why", node.Summary, width)
+		}
+	}
+	if len(row.EventIDs) > 0 {
+		writeField(b, "Events", formatEventIDs(row.EventIDs), width)
+	}
+}
+
+func renderTraceDetailOutput(b *strings.Builder, _ TraceTreeRow, node TraceTreeNodeVM, vm TraceWorkspaceVM, width int) {
+	output := ""
+	switch strings.ToLower(strings.TrimSpace(node.Kind)) {
+	case "action":
+		if child := firstChildOfKind(vm, node.ID, "observation"); child != nil {
+			output = child.Summary
+		}
+	case "observation":
+		output = node.Summary
+	default:
+		output = node.Summary
+	}
+
+	output = strings.TrimSpace(output)
+	if output == "" {
+		b.WriteString("No output captured for this node.\n")
+		return
+	}
+
+	writeField(b, "Result", output, width)
+}
+
+func renderTraceDetailEvents(b *strings.Builder, row TraceTreeRow, node TraceTreeNodeVM, width int) {
+	eventIDs := node.EventIDs
+	if len(eventIDs) == 0 {
+		eventIDs = row.EventIDs
+	}
+	if len(eventIDs) == 0 {
+		b.WriteString("No linked events.\n")
+		return
+	}
+
+	writeField(b, "Events", formatEventIDs(eventIDs), width)
+	b.WriteString("\nPress 4 to open the Events tab for raw event details.\n")
+}
+
+func renderTraceDetailDebug(b *strings.Builder, row TraceTreeRow, node TraceTreeNodeVM, width int) {
+	writeField(b, "ID", node.ID, width)
+	writeField(b, "Kind", node.Kind, width)
+	writeField(b, "Status", node.Status, width)
+	writeField(b, "Title", node.Title, width)
+	writeField(b, "Summary", node.Summary, width)
+	writeField(b, "Direction", node.DirectionID, width)
+	writeField(b, "Prompt", node.PromptID, width)
+
+	eventIDs := node.EventIDs
+	if len(eventIDs) == 0 {
+		eventIDs = row.EventIDs
+	}
+	if len(eventIDs) > 0 {
+		writeField(b, "Events", formatEventIDs(eventIDs), width)
+	}
+	if len(node.Children) > 0 {
+		writeField(b, "Children", len(node.Children), width)
+	}
+}
+
+func firstChildOfKind(vm TraceWorkspaceVM, parentID string, kind string) *TraceTreeNodeVM {
+	parent, ok := vm.Tree.Nodes[parentID]
+	if !ok {
+		return nil
+	}
+	for _, childID := range parent.Children {
+		child, ok := vm.Tree.Nodes[childID]
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(child.Kind), kind) {
+			item := child
+			return &item
+		}
+	}
+	return nil
+}
+
+func summarizeObservationForOverview(summary string) string {
+	return shortString(summary, 220)
 }
 
 func renderTraceNodeInspector(row TraceTreeRow, node TraceTreeNodeVM, width int, debug bool) string {

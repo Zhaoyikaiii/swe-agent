@@ -155,6 +155,24 @@ func TestSummaryDoesNotTreatSubmittedPlaceholderAsConclusion(t *testing.T) {
 	}
 }
 
+func TestShortStringCollapsesTabsAndNewlines(t *testing.T) {
+	got := shortString("a\t\tb\nc   d", 100)
+	if got != "a b c d" {
+		t.Fatalf("expected collapsed whitespace, got %q", got)
+	}
+}
+
+func TestWrapTextExpandsTabsWithinWidth(t *testing.T) {
+	text := "completed successfully;\tworkspace_id=workspace_id,\ttenant_id=self.tenant_id,\tdefaults={...}"
+	got := wrapText(text, 40)
+
+	for _, line := range strings.Split(got, "\n") {
+		if w := lipgloss.Width(line); w > 40 {
+			t.Fatalf("line width=%d exceeds 40: %q\nfull:\n%s", w, line, got)
+		}
+	}
+}
+
 func TestFinalReviewUsesNarrativeBeforeFallback(t *testing.T) {
 	record := taskRecord{
 		Task:      core.Task{Text: "fix it", Repo: "/repo"},
@@ -393,14 +411,18 @@ func TestTraceWorkspaceRendersConcreteTraceTreeExample(t *testing.T) {
 		"Validation: not recorded",
 		"Active: Resolve the Go import cycle",
 		"Symptom: Go compile failed with import cycle not allowed: go test ./...",
-		"Trace Tree",
+		"Trace Tree [active]",
+		"Selected Detail",
+		"[Overview]  Output  Events  Debug",
 		"> [-] * Task  task  running",
-		"+-- [ ] + Go compile failed with import cycle not allowed: go test ./...  symptom  observed",
+		"+-- [ ] + Go compile failed with import cycle...",
+		"symptom  observed",
 		"+-- [-] + Resolve the Go import cycle  direction  supported",
-		"|   `-- [ ] + package service imports handler and handler imports service  evidence  supports",
+		"|   `-- [ ] + package service imports",
+		"evidence  supports",
 		"`-- [ ] * Review  verify  running",
-		"Selected",
 		"What: Task",
+		"Status: running",
 		"Why: fix go test import cycle",
 	} {
 		if !strings.Contains(rendered, want) {
@@ -430,8 +452,10 @@ func TestTraceWorkspaceDebugRevealsTraceMetadata(t *testing.T) {
 	}
 
 	state := traceWorkspaceState{
-		Tab:   traceTabTrace,
-		Debug: true,
+		Tab:       traceTabTrace,
+		Debug:     true,
+		Pane:      tracePaneDetail,
+		DetailTab: traceDetailDebug,
 		Expanded: map[string]bool{
 			"node-root": true,
 		},
@@ -745,6 +769,7 @@ func TestHelpOverlayFitsTinyTerminal(t *testing.T) {
 func TestHelpOverlayRestoresApprovalMode(t *testing.T) {
 	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
 	response := make(chan policy.ApprovalDecision, 1)
+	model.view = viewTrace
 
 	model.Update(approvalMsg{
 		request: policy.ApprovalRequest{
@@ -754,6 +779,9 @@ func TestHelpOverlayRestoresApprovalMode(t *testing.T) {
 		},
 		response: response,
 	})
+	if model.view != viewTrace {
+		t.Fatalf("approval should not force the current detail view, got %v", model.view)
+	}
 
 	model.openHelp()
 	if model.mode != modeHelp {
@@ -763,6 +791,23 @@ func TestHelpOverlayRestoresApprovalMode(t *testing.T) {
 	model.handleHelpKey(tea.KeyMsg{Type: tea.KeyEsc})
 	if model.mode != modeApproval {
 		t.Fatalf("expected approval mode after closing help, got %v", model.mode)
+	}
+}
+
+func TestWaitForUIMessagePrioritizesApproval(t *testing.T) {
+	events := make(chan eventMsg, 1)
+	approvals := make(chan approvalMsg, 1)
+	response := make(chan policy.ApprovalDecision, 1)
+
+	events <- eventMsg{event: core.Event{Type: "model_response"}}
+	approvals <- approvalMsg{
+		request:  policy.ApprovalRequest{Call: core.ToolCall{Name: "shell"}},
+		response: response,
+	}
+
+	msg := waitForUIMessage(events, approvals)()
+	if _, ok := msg.(approvalMsg); !ok {
+		t.Fatalf("expected approvalMsg to be prioritized, got %T", msg)
 	}
 }
 
@@ -923,6 +968,47 @@ func TestTraceWorkspaceJKScrollsNonTreeTabs(t *testing.T) {
 	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
 	if model.detail.YOffset != before {
 		t.Fatalf("expected k to scroll events tab back to %d, got %d", before, model.detail.YOffset)
+	}
+}
+
+func TestTraceWorkspacePaneAndDetailKeys(t *testing.T) {
+	model := newLoopModel(NewSession(), &agentpkg.Agent{}, "/repo", context.Background())
+	model.width = 120
+	model.height = 20
+	taskIndex := model.createTaskRecord(core.Task{Text: "fix go test import cycle", Repo: "/repo"}, "running", time.Now())
+	model.tasks[taskIndex].Events = mockImportCycleProblemTraceEvents()
+	model.setSelectedTask(taskIndex)
+	model.openTraceWorkspace()
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if model.traceView.Pane != tracePaneDetail {
+		t.Fatalf("expected l to focus detail pane, got %v", model.traceView.Pane)
+	}
+	if model.traceView.Tab != traceTabTrace {
+		t.Fatalf("expected l to keep trace tab selected, got %v", model.traceView.Tab)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	if model.traceView.DetailTab != traceDetailOutput {
+		t.Fatalf("expected ] to switch detail tab to output, got %v", model.traceView.DetailTab)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+	if model.traceView.DetailTab != traceDetailOverview {
+		t.Fatalf("expected [ to switch detail tab back to overview, got %v", model.traceView.DetailTab)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if model.traceView.DetailOffset != 1 {
+		t.Fatalf("expected j in detail pane to scroll detail, got offset=%d", model.traceView.DetailOffset)
+	}
+
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	if model.traceView.Pane != tracePaneTree {
+		t.Fatalf("expected h to focus tree pane, got %v", model.traceView.Pane)
+	}
+	model.handleNormalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if model.traceView.Cursor != 1 {
+		t.Fatalf("expected j in tree pane to move cursor, got %d", model.traceView.Cursor)
 	}
 }
 

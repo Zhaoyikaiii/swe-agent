@@ -161,13 +161,32 @@ const (
 	traceTabCards
 )
 
+type tracePane int
+
+const (
+	tracePaneTree tracePane = iota
+	tracePaneDetail
+)
+
+type traceDetailTab int
+
+const (
+	traceDetailOverview traceDetailTab = iota
+	traceDetailOutput
+	traceDetailEvents
+	traceDetailDebug
+)
+
 type traceWorkspaceState struct {
-	Tab        traceTab
-	Cursor     int
-	SelectedID string
-	Expanded   map[string]bool
-	FollowLive bool
-	Debug      bool
+	Tab          traceTab
+	Cursor       int
+	SelectedID   string
+	Expanded     map[string]bool
+	FollowLive   bool
+	Debug        bool
+	Pane         tracePane
+	DetailTab    traceDetailTab
+	DetailOffset int
 }
 
 type sidebarMode int
@@ -341,8 +360,7 @@ func newModel(session *Session, ag *agentpkg.Agent, task core.Task, parent conte
 func (m *model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		m.spinner.Tick,
-		waitForEvent(m.session.events),
-		waitForApproval(m.session.approvals),
+		waitForUIMessage(m.session.events, m.session.approvals),
 	}
 	if m.mode == modeTask {
 		cmds = append(cmds, m.command.Focus())
@@ -353,15 +371,20 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func waitForEvent(ch <-chan eventMsg) tea.Cmd {
+func waitForUIMessage(events <-chan eventMsg, approvals <-chan approvalMsg) tea.Cmd {
 	return func() tea.Msg {
-		return <-ch
-	}
-}
+		select {
+		case msg := <-approvals:
+			return msg
+		default:
+		}
 
-func waitForApproval(ch <-chan approvalMsg) tea.Cmd {
-	return func() tea.Msg {
-		return <-ch
+		select {
+		case msg := <-approvals:
+			return msg
+		case msg := <-events:
+			return msg
+		}
 	}
 }
 
@@ -388,15 +411,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case eventMsg:
 		m.addEvent(msg.event)
-		cmds = append(cmds, waitForEvent(m.session.events))
+		cmds = append(cmds, waitForUIMessage(m.session.events, m.session.approvals))
 	case approvalMsg:
 		m.approval = &approvalState{msg: msg}
 		m.mode = modeApproval
 		m.status = fmt.Sprintf("approval required: %s (%s)", msg.request.Call.Name, msg.request.Risk)
 		m.setPhase(phaseApproval, fmt.Sprintf("%s requires %s approval", msg.request.Call.Name, msg.request.Risk))
-		m.view = viewOverview
-		m.updateDetail()
-		cmds = append(cmds, waitForApproval(m.session.approvals))
+		m.beforeHelp = modeNormal
+		cmds = append(cmds, waitForUIMessage(m.session.events, m.session.approvals))
 	case runDoneMsg:
 		m.running = false
 		m.done = true
@@ -480,10 +502,10 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 			m.status = "run overview"
 			m.updateDetail()
 			return nil
-		case "tab", "l", "right":
+		case "tab":
 			m.cycleTraceTab(1)
 			return nil
-		case "shift+tab", "h", "left":
+		case "shift+tab":
 			m.cycleTraceTab(-1)
 			return nil
 		case "1", "2", "3", "4", "5", "6":
@@ -495,14 +517,36 @@ func (m *model) handleNormalKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		if m.traceView.Tab == traceTabTrace {
 			switch keyString {
+			case "h", "left":
+				m.setTracePane(tracePaneTree)
+				return nil
+			case "l", "right":
+				m.setTracePane(tracePaneDetail)
+				return nil
+			case "[":
+				m.cycleTraceDetailTab(-1)
+				return nil
+			case "]":
+				m.cycleTraceDetailTab(1)
+				return nil
 			case "j", "down":
-				m.moveTraceCursor(1)
+				if m.traceView.Pane == tracePaneDetail {
+					m.moveTraceDetail(1)
+				} else {
+					m.moveTraceCursor(1)
+				}
 				return nil
 			case "k", "up":
-				m.moveTraceCursor(-1)
+				if m.traceView.Pane == tracePaneDetail {
+					m.moveTraceDetail(-1)
+				} else {
+					m.moveTraceCursor(-1)
+				}
 				return nil
 			case "enter":
-				m.toggleTraceNode()
+				if m.traceView.Pane == tracePaneTree {
+					m.toggleTraceNode()
+				}
 				return nil
 			case "o":
 				m.openTraceNode()
@@ -1275,6 +1319,12 @@ func (m *model) updatePhaseFromEvent(event core.Event) {
 		m.setPhase(phaseThinking, "waiting for model")
 	case "model_response":
 		m.setPhase(phaseProcessing, "processing model response")
+	case "tool_proposed":
+		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		m.setPhase(phaseApproval, "approval requested for "+toolName)
 	case "tool_call":
 		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
 		if toolName == "" {
@@ -1447,8 +1497,44 @@ func (m *model) cycleTraceTab(delta int) {
 	total := int(traceTabCards) + 1
 	next := (int(m.traceView.Tab) + delta + total) % total
 	m.traceView.Tab = traceTab(next)
+	m.traceView.DetailOffset = 0
 	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
 	m.detail.GotoTop()
+	m.updateDetail()
+}
+
+func (m *model) setTracePane(pane tracePane) {
+	if m.traceView.Tab != traceTabTrace {
+		return
+	}
+	m.traceView.Pane = pane
+	switch pane {
+	case tracePaneDetail:
+		m.status = "trace: detail"
+	default:
+		m.status = "trace: tree"
+	}
+	m.updateDetail()
+}
+
+func (m *model) cycleTraceDetailTab(delta int) {
+	if m.traceView.Tab != traceTabTrace {
+		return
+	}
+	total := int(traceDetailDebug) + 1
+	next := (int(m.traceView.DetailTab) + delta + total) % total
+	m.traceView.DetailTab = traceDetailTab(next)
+	m.traceView.Pane = tracePaneDetail
+	m.traceView.DetailOffset = 0
+	m.status = "trace detail: " + traceDetailTabLabel(m.traceView.DetailTab)
+	m.updateDetail()
+}
+
+func (m *model) moveTraceDetail(delta int) {
+	if m.traceView.Tab != traceTabTrace {
+		return
+	}
+	m.traceView.DetailOffset = max(0, m.traceView.DetailOffset+delta)
 	m.updateDetail()
 }
 
@@ -1471,6 +1557,7 @@ func (m *model) moveTraceCursor(delta int) {
 	normalizeTraceCursor(&m.traceView, vm.Rows)
 	m.traceView.Cursor = clamp(m.traceView.Cursor+delta, 0, len(vm.Rows)-1)
 	m.traceView.SelectedID = vm.Rows[m.traceView.Cursor].NodeID
+	m.traceView.DetailOffset = 0
 	m.updateDetail()
 }
 
@@ -1515,7 +1602,10 @@ func (m *model) openTraceNode() {
 	normalizeTraceCursor(&m.traceView, vm.Rows)
 	row := vm.Rows[m.traceView.Cursor]
 	m.traceView.SelectedID = row.NodeID
-	m.status = "trace node: " + row.NodeID
+	m.traceView.Pane = tracePaneDetail
+	m.traceView.DetailTab = traceDetailOutput
+	m.traceView.DetailOffset = 0
+	m.status = "trace detail: " + traceDetailTabLabel(m.traceView.DetailTab)
 	m.updateDetail()
 }
 
@@ -1526,6 +1616,7 @@ func (m *model) toggleTraceDebug() {
 	} else {
 		m.status = "trace debug: off"
 	}
+	m.traceView.DetailOffset = 0
 	m.detail.GotoTop()
 	m.updateDetail()
 }
@@ -1551,6 +1642,7 @@ func (m *model) setTraceTab(key string) {
 	case "6":
 		m.traceView.Tab = traceTabCards
 	}
+	m.traceView.DetailOffset = 0
 	m.status = "trace: " + traceTabLabel(m.traceView.Tab)
 	m.detail.GotoTop()
 	m.updateDetail()
@@ -1815,7 +1907,7 @@ func (m *model) detailContent() string {
 		return "No validation yet."
 	case viewTrace:
 		if record := m.selectedTaskRecord(); record != nil {
-			return traceWorkspaceViewWidth(*record, m.traceView, m.detail.Width, m.trajectoryPath())
+			return traceWorkspaceView(*record, m.traceView, m.detail.Width, m.detail.Height, m.trajectoryPath())
 		}
 		return "Problem Trace\n\nNo run selected."
 	default:
@@ -2038,7 +2130,7 @@ func (m *model) inspectorView(width int) string {
 	case viewTests:
 		b.WriteString(validationViewWidth(snapshot, width))
 	case viewTrace:
-		b.WriteString(traceWorkspaceViewWidth(*record, m.traceView, width, m.trajectoryPath()))
+		b.WriteString(traceWorkspaceView(*record, m.traceView, width, 0, m.trajectoryPath()))
 	default:
 		b.WriteString(planInspectorWidth(*record, snapshot, width))
 	}
@@ -2293,7 +2385,7 @@ func overlayRows(base, popup string, width, height int) string {
 
 func (m *model) shortHelp() []key.Binding {
 	if m.view == viewTrace && m.mode == modeNormal {
-		return []key.Binding{keyTraceMove, keyTraceFold, keyTraceInspect, keyTraceDebug, keyTraceTabs, keyEsc}
+		return []key.Binding{keyTraceMove, keyTracePane, keyTraceFold, keyTraceInspect, keyTraceDetailTabs, keyTraceDebug, keyTraceTabs, keyEsc}
 	}
 
 	switch m.mode {
@@ -2328,6 +2420,8 @@ func summarizeEvent(event core.Event) string {
 		return "Waiting for model"
 	case "model_response":
 		return "Planning next action"
+	case "tool_proposed":
+		return "Approval requested: " + shortString(event.Data["tool"], 48)
 	case "tool_call":
 		toolName := strings.TrimSpace(fmt.Sprint(event.Data["tool"]))
 		if toolName == "" {
@@ -2385,6 +2479,14 @@ func eventDetailWidth(event core.Event, width int) string {
 		if usage, ok := event.Data["usage"]; ok {
 			writeSection(&b, "Usage")
 			writeValueTree(&b, "", usage, 0, width)
+		}
+	case "tool_proposed":
+		writeSection(&b, "Tool Proposed")
+		writeField(&b, "Tool", event.Data["tool"], width)
+		writeField(&b, "Risk", event.Data["risk"], width)
+		if args, ok := event.Data["args"]; ok {
+			writeSection(&b, "Arguments")
+			writeValueTree(&b, "", args, 0, width)
 		}
 	case "tool_call":
 		writeSection(&b, "Tool Call")
@@ -2983,7 +3085,8 @@ func writeField(b *strings.Builder, key string, value any, width int) {
 	if text == "" {
 		return
 	}
-	if strings.Contains(text, "\n") || (width > 0 && len([]rune(key+": "+text)) > width) {
+	text = formatDisplayText(text)
+	if strings.Contains(text, "\n") || (width > 0 && displayWidth(key+": "+text) > width) {
 		fmt.Fprintf(b, "%s:\n", key)
 		b.WriteString(indentText(wrapText(text, remainingWidth(width, 2)), 2))
 		b.WriteByte('\n')
@@ -3026,7 +3129,7 @@ func writeValueTree(b *strings.Builder, key string, value any, indent int, width
 			writeListItem(b, item, indent+1, width)
 		}
 	default:
-		text := strings.TrimSpace(formatScalar(typed))
+		text := strings.TrimSpace(formatDisplayText(formatScalar(typed)))
 		if text == "" {
 			return
 		}
@@ -3036,7 +3139,7 @@ func writeValueTree(b *strings.Builder, key string, value any, indent int, width
 			return
 		}
 		line := fmt.Sprintf("%s%s: %s", prefix, key, text)
-		if width > 0 && len([]rune(line)) > width {
+		if width > 0 && displayWidth(line) > width {
 			fmt.Fprintf(b, "%s%s:\n", prefix, key)
 			b.WriteString(indentText(wrapText(text, remainingWidth(width, len(prefix)+2)), indent*2+2))
 			b.WriteByte('\n')
@@ -3058,12 +3161,12 @@ func writeListItem(b *strings.Builder, value any, indent int, width int) {
 		fmt.Fprintf(b, "%s-\n", prefix)
 		writeValueTree(b, "", typed, indent+1, width)
 	default:
-		text := strings.TrimSpace(formatScalar(typed))
+		text := strings.TrimSpace(formatDisplayText(formatScalar(typed)))
 		if text == "" {
 			return
 		}
 		line := fmt.Sprintf("%s- %s", prefix, text)
-		if width > 0 && len([]rune(line)) > width {
+		if width > 0 && displayWidth(line) > width {
 			fmt.Fprintf(b, "%s-\n", prefix)
 			b.WriteString(indentText(wrapText(text, remainingWidth(width, len(prefix)+2)), indent*2+2))
 			b.WriteByte('\n')
@@ -3211,45 +3314,115 @@ func intValue(value any) int {
 
 func shortString(value any, limit int) string {
 	s := strings.TrimSpace(fmt.Sprint(value))
-	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
 	return truncate(s, limit)
 }
 
+const tuiTabWidth = 4
+
 func wrapText(s string, width int) string {
 	if width <= 0 {
-		return s
+		return formatDisplayText(s)
 	}
+
 	var out []string
-	for _, line := range strings.Split(s, "\n") {
+	for _, line := range strings.Split(formatDisplayText(s), "\n") {
 		out = append(out, wrapLine(line, width)...)
 	}
 	return strings.Join(out, "\n")
 }
 
 func wrapLine(line string, width int) []string {
-	if width <= 0 || len([]rune(line)) <= width {
+	line = formatDisplayText(line)
+
+	if width <= 0 || displayWidth(line) <= width {
 		return []string{line}
 	}
-	runes := []rune(line)
-	lines := make([]string, 0, len(runes)/width+1)
-	for len(runes) > width {
-		breakAt := width
-		for i := width; i > 0; i-- {
-			if runes[i-1] == ' ' || runes[i-1] == '\t' {
-				breakAt = i
+
+	var lines []string
+	for displayWidth(line) > width {
+		runes := []rune(line)
+		cut := 0
+		lastBreak := -1
+		currentWidth := 0
+
+		for i, r := range runes {
+			nextWidth := currentWidth + lipgloss.Width(string(r))
+			if nextWidth > width {
+				if lastBreak > 0 {
+					cut = lastBreak
+				} else {
+					cut = i
+				}
 				break
 			}
+
+			currentWidth = nextWidth
+
+			switch r {
+			case ' ', ',', '.', '/', '-', '_', ')', '}', ']':
+				lastBreak = i + 1
+			}
 		}
-		part := strings.TrimRight(string(runes[:breakAt]), " \t")
+
+		if cut <= 0 {
+			cut = 1
+		}
+
+		part := strings.TrimRight(string(runes[:cut]), " ")
 		if part == "" {
-			part = string(runes[:width])
-			breakAt = width
+			part = string(runes[:cut])
 		}
 		lines = append(lines, part)
-		runes = []rune(strings.TrimLeft(string(runes[breakAt:]), " \t"))
+
+		line = strings.TrimLeft(string(runes[cut:]), " ")
 	}
-	lines = append(lines, string(runes))
+
+	if line != "" || len(lines) == 0 {
+		lines = append(lines, line)
+	}
+
 	return lines
+}
+
+func formatDisplayText(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return expandTabs(s, tuiTabWidth)
+}
+
+func expandTabs(s string, tabWidth int) string {
+	if tabWidth <= 0 {
+		tabWidth = 4
+	}
+
+	var b strings.Builder
+	col := 0
+
+	for _, r := range s {
+		switch r {
+		case '\n':
+			b.WriteRune(r)
+			col = 0
+		case '\t':
+			spaces := tabWidth - (col % tabWidth)
+			b.WriteString(strings.Repeat(" ", spaces))
+			col += spaces
+		default:
+			b.WriteRune(r)
+			w := lipgloss.Width(string(r))
+			if w <= 0 {
+				w = 1
+			}
+			col += w
+		}
+	}
+
+	return b.String()
+}
+
+func displayWidth(s string) int {
+	return lipgloss.Width(formatDisplayText(s))
 }
 
 func truncate(s string, limit int) string {
@@ -3410,43 +3583,45 @@ var (
 )
 
 var (
-	keyMove           = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "move"))
-	keyLeftRight      = key.NewBinding(key.WithKeys("h/l", "left/right"), key.WithHelp("h/l", "focus pane"))
-	keyTop            = key.NewBinding(key.WithKeys("gg"), key.WithHelp("gg", "top"))
-	keyBottom         = key.NewBinding(key.WithKeys("G"), key.WithHelp("G", "bottom"))
-	keyCenter         = key.NewBinding(key.WithKeys("zz"), key.WithHelp("zz", "center"))
-	keyScrollHalf     = key.NewBinding(key.WithKeys("ctrl+d", "ctrl+u"), key.WithHelp("ctrl+d/u", "half page"))
-	keyScrollPage     = key.NewBinding(key.WithKeys("ctrl+f", "ctrl+b"), key.WithHelp("ctrl+f/b", "page"))
-	keyTab            = key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch pane"))
-	keyOpen           = key.NewBinding(key.WithKeys("enter", "o"), key.WithHelp("enter/o", "detail"))
-	keySearch         = key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search"))
-	keyNext           = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next match"))
-	keyPrev           = key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match"))
-	keyTaskInput      = key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "task input"))
-	keyCommand        = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
-	keyHelp           = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
-	keyDiff           = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
-	keyTests          = key.NewBinding(key.WithKeys("v", ":tests"), key.WithHelp("v", "validation"))
-	keySteps          = key.NewBinding(key.WithKeys("s", ":steps"), key.WithHelp("s", "steps"))
-	keyTimeline       = key.NewBinding(key.WithKeys("t", ":overview"), key.WithHelp("t", "overview"))
-	keyHistory        = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
-	keyTrace          = key.NewBinding(key.WithKeys("x", ":trace"), key.WithHelp("x", "trace workspace"))
-	keyOpenTrace      = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
-	keyTraceMove      = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "node"))
-	keyTraceFold      = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "fold"))
-	keyTraceInspect   = key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "inspect"))
-	keyTraceDebug     = key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "debug"))
-	keyTraceTabs      = key.NewBinding(key.WithKeys("tab", "1-6"), key.WithHelp("tab/1-6", "trace tabs"))
-	keySlashHelp      = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
-	keySlashHistory   = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
-	keySlashClear     = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
-	keySlashQuit      = key.NewBinding(key.WithKeys("/quit"), key.WithHelp("/quit", "quit"))
-	keyAllow          = key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "allow"))
-	keyDeny           = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "deny"))
-	keyRemember       = key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "allow risk"))
-	keyExpandApproval = key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "expand approval"))
-	keyQuit           = key.NewBinding(key.WithKeys("q"), key.WithHelp("q", "quit"))
-	keyCancel         = key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "cancel"))
-	keyEnter          = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "submit"))
-	keyEsc            = key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back"))
+	keyMove            = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "move"))
+	keyLeftRight       = key.NewBinding(key.WithKeys("h/l", "left/right"), key.WithHelp("h/l", "focus pane"))
+	keyTop             = key.NewBinding(key.WithKeys("gg"), key.WithHelp("gg", "top"))
+	keyBottom          = key.NewBinding(key.WithKeys("G"), key.WithHelp("G", "bottom"))
+	keyCenter          = key.NewBinding(key.WithKeys("zz"), key.WithHelp("zz", "center"))
+	keyScrollHalf      = key.NewBinding(key.WithKeys("ctrl+d", "ctrl+u"), key.WithHelp("ctrl+d/u", "half page"))
+	keyScrollPage      = key.NewBinding(key.WithKeys("ctrl+f", "ctrl+b"), key.WithHelp("ctrl+f/b", "page"))
+	keyTab             = key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch pane"))
+	keyOpen            = key.NewBinding(key.WithKeys("enter", "o"), key.WithHelp("enter/o", "detail"))
+	keySearch          = key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search"))
+	keyNext            = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next match"))
+	keyPrev            = key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match"))
+	keyTaskInput       = key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "task input"))
+	keyCommand         = key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command"))
+	keyHelp            = key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help"))
+	keyDiff            = key.NewBinding(key.WithKeys("d", ":diff"), key.WithHelp("d", "diff"))
+	keyTests           = key.NewBinding(key.WithKeys("v", ":tests"), key.WithHelp("v", "validation"))
+	keySteps           = key.NewBinding(key.WithKeys("s", ":steps"), key.WithHelp("s", "steps"))
+	keyTimeline        = key.NewBinding(key.WithKeys("t", ":overview"), key.WithHelp("t", "overview"))
+	keyHistory         = key.NewBinding(key.WithKeys(":history"), key.WithHelp(":history", "task history"))
+	keyTrace           = key.NewBinding(key.WithKeys("x", ":trace"), key.WithHelp("x", "trace workspace"))
+	keyOpenTrace       = key.NewBinding(key.WithKeys(":open-trace"), key.WithHelp(":open-trace", "$EDITOR trace"))
+	keyTraceMove       = key.NewBinding(key.WithKeys("j/k", "up/down"), key.WithHelp("j/k", "node"))
+	keyTracePane       = key.NewBinding(key.WithKeys("h/l"), key.WithHelp("h/l", "pane"))
+	keyTraceFold       = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "fold"))
+	keyTraceInspect    = key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "inspect"))
+	keyTraceDetailTabs = key.NewBinding(key.WithKeys("[/]"), key.WithHelp("[/]", "detail"))
+	keyTraceDebug      = key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "debug"))
+	keyTraceTabs       = key.NewBinding(key.WithKeys("tab", "1-6"), key.WithHelp("tab/1-6", "trace tabs"))
+	keySlashHelp       = key.NewBinding(key.WithKeys("/help"), key.WithHelp("/help", "help"))
+	keySlashHistory    = key.NewBinding(key.WithKeys("/history"), key.WithHelp("/history", "history"))
+	keySlashClear      = key.NewBinding(key.WithKeys("/clear"), key.WithHelp("/clear", "clear"))
+	keySlashQuit       = key.NewBinding(key.WithKeys("/quit"), key.WithHelp("/quit", "quit"))
+	keyAllow           = key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "allow"))
+	keyDeny            = key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "deny"))
+	keyRemember        = key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "allow risk"))
+	keyExpandApproval  = key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "expand approval"))
+	keyQuit            = key.NewBinding(key.WithKeys("q"), key.WithHelp("q", "quit"))
+	keyCancel          = key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "cancel"))
+	keyEnter           = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "submit"))
+	keyEsc             = key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back"))
 )
