@@ -109,8 +109,13 @@ func (m *CodexCLI) Complete(ctx context.Context, req core.ModelRequest) (core.Mo
 	if content == "" {
 		return core.ModelResponse{}, fmt.Errorf("codex exec returned an empty message\n%s", diag.String())
 	}
+	diag.lastMessage = content
 	return core.ModelResponse{
-		Message: core.Message{Role: core.RoleAssistant, Content: content},
+		Message: core.Message{
+			Role:    core.RoleAssistant,
+			Content: content,
+			Extra:   diag.Extra(),
+		},
 		Usage: core.Usage{
 			OutputTokens: len(content) / 4,
 		},
@@ -148,14 +153,15 @@ func (m *CodexCLI) args(workingDir, outputPath string) []string {
 }
 
 type codexExecDiagnostics struct {
-	command    string
-	args       []string
-	elapsed    time.Duration
-	outputPath string
-	outputSize int
-	readErr    error
-	stdout     string
-	stderr     string
+	command     string
+	args        []string
+	elapsed     time.Duration
+	outputPath  string
+	outputSize  int
+	readErr     error
+	stdout      string
+	stderr      string
+	lastMessage string
 }
 
 func (d codexExecDiagnostics) String() string {
@@ -169,7 +175,25 @@ func (d codexExecDiagnostics) String() string {
 	b.WriteByte('\n')
 	fmt.Fprintf(&b, "stdout:\n%s\n", indentDiagnostic(previewDiagnostic(d.stdout)))
 	fmt.Fprintf(&b, "stderr:\n%s", indentDiagnostic(previewDiagnostic(d.stderr)))
+	if strings.TrimSpace(d.lastMessage) != "" {
+		fmt.Fprintf(&b, "\nlast_message:\n%s", indentDiagnostic(previewDiagnostic(d.lastMessage)))
+	}
 	return b.String()
+}
+
+func (d codexExecDiagnostics) Extra() map[string]string {
+	extra := map[string]string{
+		"codex_command":              shellQuote(append([]string{d.command}, d.args...)),
+		"codex_elapsed":              d.elapsed.Truncate(time.Millisecond).String(),
+		"codex_output_last_message":  d.outputPath,
+		"codex_stdout_preview":       previewDiagnostic(d.stdout),
+		"codex_stderr_preview":       previewDiagnostic(d.stderr),
+		"codex_last_message_preview": previewDiagnostic(d.lastMessage),
+	}
+	if d.readErr != nil {
+		extra["codex_output_read_error"] = d.readErr.Error()
+	}
+	return extra
 }
 
 func shellQuote(args []string) string {
@@ -325,12 +349,20 @@ func buildCodexPrompt(req core.ModelRequest) string {
 	b.WriteString("You are the decision model inside a Go SWE-agent.\n")
 	b.WriteString("Do not solve the task by editing files yourself. Do not make final prose unless submitting.\n")
 	b.WriteString("Return exactly one fenced shell action block and no other fenced blocks.\n")
+	b.WriteString("Never submit immediately for tasks that mention fixes, PR review, unresolved comments, commit, or push.\n")
 	b.WriteString("Use this exact format:\n\n")
 	b.WriteString("```swe_shell\n")
 	b.WriteString("<one command for the outer SWE-agent to run>\n")
 	b.WriteString("```\n\n")
 	b.WriteString("When the task is complete, return:\n\n")
 	b.WriteString("```swe_shell\nsubmit\n```\n\n")
+	b.WriteString("Before submit:\n")
+	b.WriteString("- If the task requires code changes, confirm a workspace change or successful git commit was recorded.\n")
+	b.WriteString("- If the task asks for tests or validation, run a validation command successfully.\n")
+	b.WriteString("- If the task asks for commit, run git commit successfully.\n")
+	b.WriteString("- If the task asks for push, run git push successfully.\n")
+	b.WriteString("- If the task references a GitHub PR, inspect the PR and review comments first.\n")
+	b.WriteString("- If required external access is missing, run a diagnostic command and surface the blocker instead of submitting.\n\n")
 	if req.WorkingDir != "" {
 		fmt.Fprintf(&b, "Outer agent workspace: %s\n\n", req.WorkingDir)
 	}

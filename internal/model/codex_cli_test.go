@@ -29,6 +29,8 @@ func TestCodexCLICompleteUsesOutputLastMessage(t *testing.T) {
 		"  shift\n" +
 		"done\n" +
 		"cat > \"$CAPTURE_PROMPT\"\n" +
+		"printf 'debug stdout\\n'\n" +
+		"printf 'debug stderr\\n' >&2\n" +
 		"printf '```swe_shell\\nsubmit\\n```' > \"$out\"\n"
 	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake codex: %v", err)
@@ -60,6 +62,16 @@ func TestCodexCLICompleteUsesOutputLastMessage(t *testing.T) {
 	if got := resp.Message.Content; got != "```swe_shell\nsubmit\n```" {
 		t.Fatalf("unexpected content: %q", got)
 	}
+	for key, want := range map[string]string{
+		"codex_command":              "--output-last-message",
+		"codex_stdout_preview":       "debug stdout",
+		"codex_stderr_preview":       "debug stderr",
+		"codex_last_message_preview": "```swe_shell\nsubmit\n```",
+	} {
+		if got := resp.Message.Extra[key]; !strings.Contains(got, want) {
+			t.Fatalf("extra[%s] missing %q: %#v", key, want, resp.Message.Extra)
+		}
+	}
 
 	promptBytes, err := os.ReadFile(capturePrompt)
 	if err != nil {
@@ -68,6 +80,8 @@ func TestCodexCLICompleteUsesOutputLastMessage(t *testing.T) {
 	prompt := string(promptBytes)
 	for _, want := range []string{
 		"Return exactly one fenced shell action block",
+		"Never submit immediately for tasks that mention fixes",
+		"If the task references a GitHub PR, inspect the PR and review comments first.",
 		"Outer agent workspace: /repo",
 		"- shell: Run a command.",
 		"<tool name=shell>",
@@ -200,7 +214,7 @@ func TestBuildCodexPromptRequiresOneShellAction(t *testing.T) {
 	prompt := buildCodexPrompt(core.ModelRequest{
 		Messages: []core.Message{{Role: core.RoleUser, Content: "task"}},
 	})
-	for _, want := range []string{"```swe_shell", "submit", "Conversation so far:"} {
+	for _, want := range []string{"```swe_shell", "submit", "Before submit:", "Conversation so far:"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
